@@ -102,7 +102,8 @@ export const login = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Email and password are required.' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase(), isDeleted: false });
+    const cleanEmail = (email || '').trim().toLowerCase();
+    const user = await User.findOne({ email: cleanEmail, isDeleted: false });
     if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid email or password.' });
     }

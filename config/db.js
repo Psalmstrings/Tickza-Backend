@@ -4,7 +4,7 @@ export const connectDB = async () => {
   const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/tickapp';
   try {
     const conn = await mongoose.connect(uri, {
-      serverSelectionTimeoutMS: 2500,
+      serverSelectionTimeoutMS: 15000,
     });
     console.log(`[Database] MongoDB Connected: ${conn.connection.host}`);
     return conn;
