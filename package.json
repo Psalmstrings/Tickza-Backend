@@ -1,0 +1,28 @@
+{
+  "name": "tickapp-server",
+  "version": "1.0.0",
+  "description": "TickApp Ticketing Platform Backend API",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "seed": "node utils/seed.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "cloudinary": "^2.5.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.9.5",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^10.1.3"
+  }
+}
