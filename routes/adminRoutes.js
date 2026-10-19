@@ -11,6 +11,13 @@ import {
   getAdminOrders,
   getAuditLogs,
   getStats,
+  getAdminFinancials,
+  getAdminPayouts,
+  approvePayout,
+  rejectPayout,
+  retryPayout,
+  getFinancialSettings,
+  updateFinancialSettings,
 } from '../controllers/adminController.js';
 import { getEventCheckIns } from '../controllers/checkInController.js';
 import { protect, requireAdmin } from '../middleware/authMiddleware.js';
@@ -62,5 +69,27 @@ router.get('/audit-logs', getAuditLogs);
 // ── Check-Ins ──────────────────────────────────────────────────────────────
 // @route  GET /api/admin/checkins/:eventId
 router.get('/checkins/:eventId', getEventCheckIns);
+
+// ── Financials & Payout Approvals ──────────────────────────────────────────
+// @route  GET   /api/admin/financials/overview
+router.get('/financials/overview', getAdminFinancials);
+
+// @route  GET   /api/admin/financials/payouts
+router.get('/financials/payouts', getAdminPayouts);
+
+// @route  POST  /api/admin/financials/payouts/:id/approve
+router.post('/financials/payouts/:id/approve', approvePayout);
+
+// @route  POST  /api/admin/financials/payouts/:id/reject
+router.post('/financials/payouts/:id/reject', rejectPayout);
+
+// @route  POST  /api/admin/financials/payouts/:id/retry
+router.post('/financials/payouts/:id/retry', retryPayout);
+
+// @route  GET   /api/admin/financials/settings
+router.get('/financials/settings', getFinancialSettings);
+
+// @route  PUT   /api/admin/financials/settings
+router.put('/financials/settings', updateFinancialSettings);
 
 export default router;

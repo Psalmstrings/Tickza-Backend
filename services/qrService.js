@@ -13,7 +13,7 @@ export const generateSecureQRToken = (ticketId, eventId, ownerId) => {
     .createHmac('sha256', QR_SECRET)
     .update(payload)
     .digest('hex');
-  return `TICKAPP-V1.${Buffer.from(payload).toString('base64url')}.${signature.slice(0, 16)}`;
+  return `TICKZA-V1.${Buffer.from(payload).toString('base64url')}.${signature.slice(0, 16)}`;
 };
 
 /**
@@ -22,7 +22,7 @@ export const generateSecureQRToken = (ticketId, eventId, ownerId) => {
 export const verifySecureQRToken = (token) => {
   try {
     const parts = token.split('.');
-    if (parts.length !== 3 || parts[0] !== 'TICKAPP-V1') {
+    if (parts.length !== 3 || (parts[0] !== 'TICKZA-V1' && parts[0] !== 'TICKAPP-V1')) {
       return { valid: false, error: 'Invalid QR token format' };
     }
     const payload = Buffer.from(parts[1], 'base64url').toString();

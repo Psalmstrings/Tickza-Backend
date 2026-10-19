@@ -11,7 +11,7 @@ import { logAudit } from '../services/auditService.js';
 // @access  Private (Admin or Approved event organizer / staff)
 export const scanQR = async (req, res) => {
   try {
-    const { qrToken } = req.body;
+    const { qrToken, eventId } = req.body;
 
     if (!qrToken) {
       return res.status(400).json({ success: false, message: 'QR token is required.' });
@@ -38,7 +38,7 @@ export const scanQR = async (req, res) => {
       return res.status(404).json({
         success: false,
         code:    'TICKET_NOT_FOUND',
-        message: 'Ticket not found. The QR code may have been invalidated (e.g. transferred or resold).',
+        message: 'Pass/ticket not found. The QR code may have been invalidated (e.g. transferred or resold).',
       });
     }
 
@@ -52,6 +52,22 @@ export const scanQR = async (req, res) => {
         success: false,
         code:    'NOT_AUTHORIZED_FOR_EVENT',
         message: 'You are not authorised to check in tickets for this event.',
+      });
+    }
+
+    // Optional eventId mismatch safeguard (if client specifies the expected event)
+    if (eventId && event._id.toString() !== eventId.toString()) {
+      return res.status(400).json({
+        success: false,
+        code:    'EVENT_MISMATCH',
+        message: `This pass is for "${event.title}", not the selected event.`,
+        data: {
+          expectedEventId: eventId,
+          actualEvent: {
+            id: event._id,
+            title: event.title,
+          },
+        },
       });
     }
 
@@ -93,7 +109,7 @@ export const scanQR = async (req, res) => {
     }
 
     // ── Step 5: Validate ticket status ───────────────────────────────────────
-    if (ticket.status === 'CANCELLED' || ticket.status === 'REFUNDED') {
+    if (ticket.status === 'CANCELLED' || ticket.status === 'REFUNDED' || ticket.status === 'AVAILABLE') {
       await CheckIn.create({
         ticketId:    ticket._id,
         eventId:     event._id,
@@ -106,7 +122,7 @@ export const scanQR = async (req, res) => {
       return res.status(400).json({
         success: false,
         code:    'TICKET_INVALID',
-        message: `This ticket cannot be used: status is ${ticket.status}.`,
+        message: `This pass / ticket cannot be used: status is ${ticket.status}.`,
       });
     }
 
@@ -141,10 +157,11 @@ export const scanQR = async (req, res) => {
     });
 
     // Notify the ticket owner
+    const isFree = ticket.admissionType === 'FREE';
     await Notification.create({
       userId:  ticket.ownerId._id,
-      title:   'Ticket Checked In ✅',
-      message: `Your pass for "${event.title}" has been successfully scanned (${newCheckedInCount}/${admittedCapacity} admitted). Enjoy the event!`,
+      title:   isFree ? 'Pass Checked In ✅' : 'Ticket Checked In ✅',
+      message: `Your ${isFree ? 'free pass' : 'ticket'} for "${event.title}" has been successfully scanned (${newCheckedInCount}/${admittedCapacity} admitted). Enjoy the event!`,
       type:    'CHECK_IN',
       data:    { ticketId: ticket._id, eventId: event._id },
     });
@@ -153,6 +170,8 @@ export const scanQR = async (req, res) => {
     emitToEvent(event._id, 'check_in', {
       ticketId:           ticket._id,
       ticketNumber:       ticket.ticketNumber,
+      admissionType:      ticket.admissionType || 'PAID',
+      registrationRef:    ticket.registrationRef || null,
       section:            ticket.section,
       owner:              `${ticket.ownerId.firstName} ${ticket.ownerId.lastName}`,
       admittedCapacity,
@@ -167,20 +186,24 @@ export const scanQR = async (req, res) => {
       action:     'TICKET_CHECKED_IN',
       targetType: 'TICKET',
       targetId:   ticket._id,
-      details:    { eventId: event._id, ticketNumber: ticket.ticketNumber, admitted: countToAdmit, capacity: admittedCapacity },
+      details:    { eventId: event._id, ticketNumber: ticket.ticketNumber, admitted: countToAdmit, capacity: admittedCapacity, admissionType: ticket.admissionType || 'PAID' },
       req,
     });
 
     return res.json({
       success: true,
       code:    'CHECK_IN_SUCCESS',
-      message: `Welcome! Ticket successfully verified for "${event.title}" (${newCheckedInCount}/${admittedCapacity} guests admitted).`,
+      message: isFree
+        ? `Welcome! Free pass verified for "${event.title}" (${newCheckedInCount}/${admittedCapacity} guests admitted).`
+        : `Welcome! Ticket successfully verified for "${event.title}" (${newCheckedInCount}/${admittedCapacity} guests admitted).`,
       data: {
         checkIn: checkInRecord,
         ticket: {
           id:                 ticket._id,
           ticketNumber:       ticket.ticketNumber,
           format:             ticket.format,
+          admissionType:      ticket.admissionType || 'PAID',
+          registrationRef:    ticket.registrationRef || null,
           admittedCapacity,
           attendeesCheckedIn: newCheckedInCount,
           section:            ticket.section,
@@ -194,7 +217,7 @@ export const scanQR = async (req, res) => {
             lastName:  ticket.ownerId.lastName,
             email:     ticket.ownerId.email,
           },
-          ticketType: ticket.ticketTypeId?.name || 'General',
+          ticketType: ticket.ticketTypeId?.name || (isFree ? 'Free Pass' : 'General'),
         },
         event: {
           id:        event._id,

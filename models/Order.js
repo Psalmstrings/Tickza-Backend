@@ -32,8 +32,14 @@ const orderSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['PENDING', 'PAID', 'CANCELLED', 'REFUNDED'],
-      default: 'PAID', // In free mode, immediately marked PAID
+      enum: ['PENDING', 'PAID', 'FREE_REGISTERED', 'CANCELLED', 'REFUNDED'],
+      default: 'PAID', // In free mode, immediately marked PAID or FREE_REGISTERED
+      index: true,
+    },
+    admissionType: {
+      type: String,
+      enum: ['PAID', 'FREE'],
+      default: 'PAID',
       index: true,
     },
     paymentMethod: {
@@ -43,6 +49,27 @@ const orderSchema = new mongoose.Schema(
     currency: {
       type: String,
       default: 'NGN',
+    },
+    paymentReference: {
+      type: String,
+      default: '',
+      index: true,
+    },
+    paidAt: {
+      type: Date,
+      default: null,
+    },
+    commissionRate: {
+      type: Number,
+      default: 0,
+    },
+    commissionAmount: {
+      type: Number,
+      default: 0,
+    },
+    vendorShare: {
+      type: Number,
+      default: 0,
     },
     items: [
       {

@@ -28,6 +28,7 @@ import adminRoutes        from './routes/adminRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
 import uploadRoutes       from './routes/uploadRoutes.js';
 import organizerRoutes    from './routes/organizerRoutes.js';
+import paymentRoutes      from './routes/paymentRoutes.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const PORT        = process.env.PORT || 5000;
@@ -78,7 +79,14 @@ app.use(cors({
   credentials: true,
 }));
 
-app.use(express.json({ limit: '10mb' }));
+app.use(
+  express.json({
+    limit: '10mb',
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 if (NODE_ENV !== 'test') {
@@ -94,7 +102,7 @@ app.use('/uploads', express.static(uploadsPath));
 app.get('/api/health', (req, res) => {
   res.json({
     success: true,
-    message: 'TickApp API is running',
+    message: 'Tickza API is running',
     environment: NODE_ENV,
     timestamp: new Date().toISOString(),
   });
@@ -105,6 +113,7 @@ app.use('/api/auth',          authRoutes);
 app.use('/api/events',        eventRoutes);
 app.use('/api/tickets',       ticketRoutes);
 app.use('/api/orders',        orderRoutes);
+app.use('/api/payments',      paymentRoutes);
 app.use('/api/transfers',     transferRoutes);
 app.use('/api/resale',        resaleRoutes);
 app.use('/api/admin',         adminRoutes);
@@ -178,13 +187,13 @@ const start = async () => {
     await seedAdmin();
 
     server.listen(PORT, () => {
-      console.log(`\n🚀 TickApp server running on port ${PORT} [${NODE_ENV}]`);
+      console.log(`\n🚀 Tickza server running on port ${PORT} [${NODE_ENV}]`);
       console.log(`   API:    http://localhost:${PORT}/api`);
       console.log(`   Health: http://localhost:${PORT}/api/health`);
       console.log(`   Client: ${CLIENT_URL}\n`);
     });
   } catch (error) {
-    console.error('❌ Failed to start TickApp server:', error.message);
+    console.error('❌ Failed to start Tickza server:', error.message);
     process.exit(1);
   }
 };

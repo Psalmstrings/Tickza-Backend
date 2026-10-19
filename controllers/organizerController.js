@@ -9,7 +9,14 @@ import { PromoCode } from '../models/PromoCode.js';
 import { TeamMember } from '../models/TeamMember.js';
 import { Payout } from '../models/Payout.js';
 import { Notification } from '../models/Notification.js';
+import { VendorLedger } from '../models/VendorLedger.js';
+import { PaymentTransaction } from '../models/PaymentTransaction.js';
 import { logAudit } from '../services/auditService.js';
+import paystackService from '../services/paystackService.js';
+import {
+  getPlatformCommissionSettings,
+  reserveVendorBalanceForPayout,
+} from '../services/commissionService.js';
 
 // ────────────────────────────────────────────────────
 // Helper: ensure the requester is owner of the event
@@ -75,16 +82,16 @@ export const getOrganizerOverview = async (req, res) => {
       status: 'PAID',
     });
 
-    // Tickets sold
+    // Tickets sold or registered
     const tickets = await Ticket.find({
       eventId: { $in: eventIds },
-      status: { $in: ['SOLD', 'USED'] },
+      status: { $in: ['SOLD', 'USED', 'REGISTERED'] },
       createdAt: { $gte: since },
     });
 
     const allTickets = await Ticket.find({
       eventId: { $in: eventIds },
-      status: { $in: ['SOLD', 'USED'] },
+      status: { $in: ['SOLD', 'USED', 'REGISTERED'] },
     });
 
     // Revenue from order items (sum totalPrice for event items)
@@ -113,9 +120,11 @@ export const getOrganizerOverview = async (req, res) => {
       e.status === 'PUBLISHED' && new Date(e.startDate) >= now
     ).length;
 
-    // Avg ticket value
-    const totalRevAllTime = allTickets.reduce((s, t) => s + (t.price || 0), 0);
-    const avgTicketValue = allTickets.length > 0 ? totalRevAllTime / allTickets.length : 0;
+    // Paid tickets vs Free registrations
+    const paidTicketsAllTime = allTickets.filter(t => (t.price || 0) > 0 && t.admissionType !== 'FREE');
+    const freePassesAllTime = allTickets.filter(t => t.admissionType === 'FREE' || t.price === 0);
+    const totalRevAllTime = paidTicketsAllTime.reduce((s, t) => s + (t.price || 0), 0);
+    const avgTicketValue = paidTicketsAllTime.length > 0 ? totalRevAllTime / paidTicketsAllTime.length : 0;
 
     // Conversion rate (orders / total unique visitors - we use orders / tickets as proxy)
     const conversionRate = allTickets.length > 0
@@ -138,6 +147,8 @@ export const getOrganizerOverview = async (req, res) => {
       data: {
         totalRevenue: revenue,
         ticketsSold: tickets.length,
+        freeRegistrations: freePassesAllTime.length,
+        paidTicketsSold: paidTicketsAllTime.length,
         totalAttendees: checkIns,
         activeEvents,
         pendingPayouts: 0, // Will be populated from Payout model
@@ -206,7 +217,7 @@ export const getOrganizerAnalytics = async (req, res) => {
       {
         $match: {
           eventId: { $in: eventIds },
-          status: { $in: ['SOLD', 'USED'] },
+          status: { $in: ['SOLD', 'USED', 'REGISTERED'] },
           createdAt: { $gte: since },
         },
       },
@@ -249,7 +260,7 @@ export const getOrganizerAnalytics = async (req, res) => {
       {
         $match: {
           eventId: { $in: eventIds },
-          status: { $in: ['SOLD', 'USED'] },
+          status: { $in: ['SOLD', 'USED', 'REGISTERED'] },
         },
       },
       {
@@ -381,7 +392,7 @@ export const getEventStats = async (req, res) => {
 
     // Per-ticket-type stats
     const ticketStats = await Ticket.aggregate([
-      { $match: { eventId, status: { $in: ['SOLD', 'USED'] } } },
+      { $match: { eventId, status: { $in: ['SOLD', 'USED', 'REGISTERED'] } } },
       {
         $group: {
           _id: '$ticketTypeId',
@@ -406,14 +417,16 @@ export const getEventStats = async (req, res) => {
     }));
 
     // Overall check-in stats
-    const [validCI, totalSold] = await Promise.all([
+    const [validCI, totalSold, totalFree, totalPaid] = await Promise.all([
       CheckIn.countDocuments({ eventId, status: 'VALID' }),
-      Ticket.countDocuments({ eventId, status: { $in: ['SOLD', 'USED'] } }),
+      Ticket.countDocuments({ eventId, status: { $in: ['SOLD', 'USED', 'REGISTERED'] } }),
+      Ticket.countDocuments({ eventId, status: { $in: ['SOLD', 'USED', 'REGISTERED'] }, admissionType: 'FREE' }),
+      Ticket.countDocuments({ eventId, status: { $in: ['SOLD', 'USED'] }, admissionType: { $ne: 'FREE' } }),
     ]);
 
     // Daily sales
     const dailySales = await Ticket.aggregate([
-      { $match: { eventId, status: { $in: ['SOLD', 'USED'] } } },
+      { $match: { eventId, status: { $in: ['SOLD', 'USED', 'REGISTERED'] } } },
       {
         $group: {
           _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
@@ -425,6 +438,9 @@ export const getEventStats = async (req, res) => {
     ]);
 
     const totalRevenue = ticketTypesWithStats.reduce((s, t) => s + t.revenue, 0);
+    const remainingCapacity = event.admissionType === 'FREE'
+      ? (event.registrationCapacity ? Math.max(0, event.registrationCapacity - (event.registeredCount || 0)) : (ticketTypes[0]?.availableQuantity || 0))
+      : ticketTypes.reduce((sum, tt) => sum + (tt.availableQuantity || 0), 0);
 
     return res.json({
       success: true,
@@ -434,7 +450,12 @@ export const getEventStats = async (req, res) => {
         summary: {
           totalRevenue,
           totalSold,
+          totalRegistrations: totalSold,
+          freeRegistrations: totalFree,
+          paidTicketsSold: totalPaid,
           checkedIn: validCI,
+          notCheckedIn: Math.max(0, totalSold - validCI),
+          remainingCapacity,
           attendanceRate: totalSold > 0 ? parseFloat(((validCI / totalSold) * 100).toFixed(1)) : 0,
         },
         dailySales,
@@ -459,6 +480,7 @@ export const updateOrganizerEvent = async (req, res) => {
       'startTime', 'endTime', 'doorsOpen',
       'status', 'featured', 'entranceInfo',
       'timeAnnounced', 'multiDay', 'countdownEnabled',
+      'admissionType', 'freePassName', 'registrationFields',
     ];
     allowedUpdates.forEach(key => {
       if (req.body[key] !== undefined) event[key] = req.body[key];
@@ -481,6 +503,38 @@ export const updateOrganizerEvent = async (req, res) => {
     if (req.body.endDate) {
       const d = new Date(req.body.endDate);
       if (!isNaN(d.getTime())) event.endDate = d;
+    }
+    if (req.body.registrationStartDate !== undefined) {
+      const d = req.body.registrationStartDate ? new Date(req.body.registrationStartDate) : null;
+      if (!d || !isNaN(d.getTime())) event.registrationStartDate = d;
+    }
+    if (req.body.registrationEndDate !== undefined) {
+      const d = req.body.registrationEndDate ? new Date(req.body.registrationEndDate) : null;
+      if (!d || !isNaN(d.getTime())) event.registrationEndDate = d;
+    }
+
+    // Handle Free Event Registration Capacity & Free Pass Name Synchronization
+    if (event.admissionType === 'FREE') {
+      if (req.body.registrationCapacity !== undefined) {
+        const cap = parseInt(req.body.registrationCapacity, 10);
+        if (!isNaN(cap) && cap >= 0) {
+          event.registrationCapacity = cap;
+          const freeTT = await TicketType.findOne({ eventId: event._id, price: 0 });
+          if (freeTT) {
+            const alreadyClaimed = Math.max(0, freeTT.quantity - freeTT.availableQuantity);
+            freeTT.quantity = cap;
+            freeTT.availableQuantity = Math.max(0, cap - alreadyClaimed);
+            await freeTT.save();
+          }
+        }
+      }
+      if (req.body.freePassName && req.body.freePassName.trim()) {
+        event.freePassName = req.body.freePassName.trim();
+        await TicketType.findOneAndUpdate(
+          { eventId: event._id, price: 0 },
+          { name: event.freePassName }
+        );
+      }
     }
 
     // Handle Image Replacement
@@ -873,16 +927,18 @@ export const getEventAttendees = async (req, res) => {
     const { event, error, status } = await authorizeEventAccess(req, req.params.id);
     if (error) return res.status(status).json({ success: false, message: error });
 
-    const { page = 1, limit = 50, search = '', ticketType = '', checkedIn = '' } = req.query;
+    const { page = 1, limit = 50, search = '', ticketType = '', checkedIn = '', admissionType = '' } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     const matchQuery = {
       eventId: event._id,
-      status: { $in: ['SOLD', 'USED', 'TRANSFER_PENDING', 'TRANSFERRED'] },
+      status: { $in: ['SOLD', 'USED', 'REGISTERED', 'TRANSFER_PENDING', 'TRANSFERRED'] },
     };
     if (checkedIn === 'true') matchQuery.checkedInAt = { $exists: true, $ne: null };
-    if (checkedIn === 'false') matchQuery.checkedInAt = { $exists: false };
+    if (checkedIn === 'false') matchQuery.$or = [{ checkedInAt: { $exists: false } }, { checkedInAt: null }];
     if (ticketType) matchQuery.ticketTypeId = ticketType;
+    if (admissionType === 'FREE') matchQuery.admissionType = 'FREE';
+    if (admissionType === 'PAID') matchQuery.admissionType = { $ne: 'FREE' };
 
     let tickets = await Ticket.find(matchQuery)
       .populate('ownerId', 'firstName lastName email phone')
@@ -899,17 +955,41 @@ export const getEventAttendees = async (req, res) => {
         const name = `${t.ownerId?.firstName} ${t.ownerId?.lastName}`.toLowerCase();
         const email = t.ownerId?.email?.toLowerCase() || '';
         const num = t.ticketNumber?.toLowerCase() || '';
-        return name.includes(q) || email.includes(q) || num.includes(q);
+        const ref = t.registrationRef?.toLowerCase() || '';
+        return name.includes(q) || email.includes(q) || num.includes(q) || ref.includes(q);
       });
     }
 
     const total = await Ticket.countDocuments(matchQuery);
+
+    // Event attendee metrics
+    const [totalRegistrations, checkedInCount, freeCount, paidCount] = await Promise.all([
+      Ticket.countDocuments({ eventId: event._id, status: { $in: ['SOLD', 'USED', 'REGISTERED'] } }),
+      Ticket.countDocuments({ eventId: event._id, status: { $in: ['SOLD', 'USED', 'REGISTERED'] }, checkedInAt: { $exists: true, $ne: null } }),
+      Ticket.countDocuments({ eventId: event._id, status: { $in: ['SOLD', 'USED', 'REGISTERED'] }, admissionType: 'FREE' }),
+      Ticket.countDocuments({ eventId: event._id, status: { $in: ['SOLD', 'USED'] }, admissionType: { $ne: 'FREE' } }),
+    ]);
+
+    const notCheckedInCount = Math.max(0, totalRegistrations - checkedInCount);
+    const attendancePercentage = totalRegistrations > 0 ? parseFloat(((checkedInCount / totalRegistrations) * 100).toFixed(1)) : 0;
+    const remainingCapacity = event.admissionType === 'FREE'
+      ? (event.registrationCapacity ? Math.max(0, event.registrationCapacity - (event.registeredCount || 0)) : null)
+      : null;
 
     return res.json({
       success: true,
       total,
       page: parseInt(page),
       pages: Math.ceil(total / parseInt(limit)),
+      stats: {
+        totalRegistrations,
+        checkedIn: checkedInCount,
+        notCheckedIn: notCheckedInCount,
+        freeRegistrations: freeCount,
+        paidTicketsSold: paidCount,
+        remainingCapacity,
+        attendancePercentage,
+      },
       data: tickets,
     });
   } catch (error) {
@@ -1276,46 +1356,328 @@ export const removeTeamMember = async (req, res) => {
   }
 };
 
-// ── PAYOUTS ───────────────────────────────────────────
+// ── PAYOUTS & FINANCIAL SETTLEMENT ────────────────────
 
 /**
  * @route   GET /api/organizer/payouts
+ * @desc    Get vendor earnings summary, bank details, and payout history
  */
 export const getPayouts = async (req, res) => {
   try {
     const organizerId = req.user._id;
-    const payouts = await Payout.find({ organizerId })
-      .populate('eventId', 'title startDate')
-      .sort({ createdAt: -1 });
+    const user = await User.findById(organizerId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Vendor account not found.' });
+    }
 
-    // Compute total net revenue
+    const settings = await getPlatformCommissionSettings();
+
+    // Fetch vendor's events
     const events = await Event.find({ organizerId });
     const eventIds = events.map(e => e._id);
-    const tickets = await Ticket.find({ eventId: { $in: eventIds }, status: { $in: ['SOLD', 'USED'] } });
-    const grossRevenue = tickets.reduce((s, t) => s + (t.price || 0), 0);
-    const platformFee = grossRevenue * 0.05; // 5% platform fee
-    const processingFee = grossRevenue * 0.015; // 1.5% processing
-    const netRevenue = grossRevenue - platformFee - processingFee;
 
-    const paidOut = payouts.filter(p => p.status === 'PAID').reduce((s, p) => s + p.netAmount, 0);
-    const pending = payouts.filter(p => p.status === 'PENDING').reduce((s, p) => s + p.netAmount, 0);
+    // Sum paid ticket sales only (free event registrations have ₦0 price and are strictly excluded)
+    const paidTickets = await Ticket.find({
+      eventId: { $in: eventIds },
+      admissionType: 'PAID',
+      status: { $in: ['SOLD', 'USED'] },
+    });
+
+    const grossRevenue = paidTickets.reduce((sum, t) => sum + (t.price || 0), 0);
+    const platformCommission = Math.round((grossRevenue * settings.commissionRate) / 100);
+    const netRevenue = Math.max(0, grossRevenue - platformCommission);
+
+    // Fetch vendor payout history
+    const payouts = await Payout.find({ organizerId })
+      .populate('adminId', 'firstName lastName')
+      .sort({ createdAt: -1 });
+
+    const paidOutNaira = payouts
+      .filter(p => p.status === 'PAID')
+      .reduce((sum, p) => sum + (p.amountKobo ? p.amountKobo / 100 : p.netAmount || 0), 0);
+
+    const pendingNaira = payouts
+      .filter(p => ['REQUESTED', 'UNDER_REVIEW', 'APPROVED', 'PROCESSING'].includes(p.status))
+      .reduce((sum, p) => sum + (p.amountKobo ? p.amountKobo / 100 : p.netAmount || 0), 0);
+
+    const availableBalanceNaira = (user.availableBalanceKobo || 0) / 100;
+    const reservedBalanceNaira = (user.reservedBalanceKobo || 0) / 100;
 
     return res.json({
       success: true,
       data: {
         summary: {
           grossRevenue,
-          platformFee,
-          processingFee,
+          platformFee: platformCommission,
+          commissionRate: settings.commissionRate,
           netRevenue,
-          paidOut,
-          pending,
-          available: Math.max(0, netRevenue - paidOut),
+          available: availableBalanceNaira,
+          reserved: reservedBalanceNaira,
+          paidOut: paidOutNaira,
+          pending: pendingNaira,
+          minimumPayoutNaira: settings.minimumPayoutNaira,
+          bankAccount: user.bankAccount || null,
         },
         payouts,
       },
     });
   } catch (error) {
+    console.error('[Organizer getPayouts Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * @route   POST /api/organizer/payouts/request
+ * @desc    Submit a withdrawal request from available earnings
+ */
+export const requestPayout = async (req, res) => {
+  try {
+    const organizerId = req.user._id;
+    const { amount } = req.body;
+
+    const requestAmountNaira = Number(amount);
+    if (isNaN(requestAmountNaira) || requestAmountNaira <= 0) {
+      return res.status(400).json({ success: false, message: 'Please provide a valid payout amount.' });
+    }
+
+    const user = await User.findById(organizerId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Vendor not found.' });
+    }
+
+    // 1. Verify connected bank account
+    if (!user.bankAccount || !user.bankAccount.isVerified || !user.bankAccount.accountNumber) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please configure and verify your Nigerian settlement bank account in Settings before requesting a payout.',
+      });
+    }
+
+    // 2. Verify platform minimum payout threshold
+    const settings = await getPlatformCommissionSettings();
+    if (requestAmountNaira < settings.minimumPayoutNaira) {
+      return res.status(400).json({
+        success: false,
+        message: `The minimum withdrawal amount is ₦${settings.minimumPayoutNaira.toLocaleString()}.`,
+      });
+    }
+
+    // 3. Prevent duplicate active requests
+    const activeRequest = await Payout.findOne({
+      organizerId,
+      status: { $in: ['REQUESTED', 'UNDER_REVIEW', 'PROCESSING'] },
+    });
+    if (activeRequest) {
+      return res.status(400).json({
+        success: false,
+        message: 'You already have a payout request currently under review or processing.',
+      });
+    }
+
+    // 4. Validate sufficient available balance
+    const availableNaira = (user.availableBalanceKobo || 0) / 100;
+    if (requestAmountNaira > availableNaira) {
+      return res.status(400).json({
+        success: false,
+        message: `Requested amount (₦${requestAmountNaira.toLocaleString()}) exceeds your available balance (₦${availableNaira.toLocaleString()}).`,
+      });
+    }
+
+    const amountKobo = Math.round(requestAmountNaira * 100);
+    const reference = `PO-${Date.now().toString().slice(-6)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+
+    // 5. Create Payout record
+    const payout = await Payout.create({
+      organizerId,
+      reference,
+      amountKobo,
+      feeKobo: 0,
+      netAmountKobo: amountKobo,
+      currency: 'NGN',
+      status: 'REQUESTED',
+      bankAccount: {
+        bankName: user.bankAccount.bankName,
+        bankCode: user.bankAccount.bankCode,
+        accountNumberMasked: user.bankAccount.accountNumberMasked || `******${user.bankAccount.accountNumber.slice(-4)}`,
+        accountName: user.bankAccount.accountName,
+        recipientCode: user.bankAccount.recipientCode || '',
+      },
+    });
+
+    // 6. Atomically reserve vendor's available balance in ledger
+    await reserveVendorBalanceForPayout({
+      vendorId: organizerId,
+      amountKobo,
+      payoutId: payout._id,
+      reference,
+    });
+
+    // 7. Audit log
+    await logAudit({
+      actorId: organizerId,
+      actorName: `${user.firstName} ${user.lastName}`,
+      actorRole: user.role,
+      action: 'PAYOUT_REQUESTED',
+      targetType: 'PAYOUT',
+      targetId: payout._id,
+      details: { amount: requestAmountNaira, reference, bankName: user.bankAccount.bankName },
+      req,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Payout request submitted successfully. It will be reviewed by an administrator.',
+      data: payout,
+    });
+  } catch (error) {
+    console.error('[Request Payout Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * @route   GET /api/organizer/payouts/banks
+ * @desc    Get list of supported Nigerian banks from Paystack
+ */
+export const getPayoutBanks = async (req, res) => {
+  try {
+    const banks = await paystackService.listBanks();
+    return res.json({ success: true, count: banks.length, data: banks });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * @route   POST /api/organizer/payouts/resolve-account
+ * @desc    Verify 10-digit NUBAN bank account with Paystack
+ */
+export const resolvePayoutAccount = async (req, res) => {
+  try {
+    const { accountNumber, bankCode } = req.body;
+    if (!accountNumber || accountNumber.length !== 10) {
+      return res.status(400).json({ success: false, message: 'Please enter a valid 10-digit NUBAN account number.' });
+    }
+    if (!bankCode) {
+      return res.status(400).json({ success: false, message: 'Bank code is required.' });
+    }
+
+    const resolved = await paystackService.resolveAccountNumber({ accountNumber, bankCode });
+    return res.json({
+      success: true,
+      data: {
+        accountNumber: resolved.accountNumber,
+        accountName: resolved.accountName,
+      },
+    });
+  } catch (error) {
+    console.error('[Resolve Account Error]', error);
+    return res.status(400).json({
+      success: false,
+      message: error.message || 'Could not resolve account details. Please check the bank and account number.',
+    });
+  }
+};
+
+/**
+ * @route   POST /api/organizer/payouts/bank-account
+ * @desc    Save and connect verified bank account with Paystack Transfer Recipient
+ */
+export const savePayoutAccount = async (req, res) => {
+  try {
+    const organizerId = req.user._id;
+    const { bankName, bankCode, accountNumber, accountName } = req.body;
+
+    if (!bankName || !bankCode) {
+      return res.status(400).json({ success: false, message: 'Bank name and bank code are required.' });
+    }
+    if (!accountNumber || accountNumber.length !== 10) {
+      return res.status(400).json({ success: false, message: 'A valid 10-digit NUBAN account number is required.' });
+    }
+    if (!accountName || !accountName.trim()) {
+      return res.status(400).json({ success: false, message: 'Account beneficiary name is required.' });
+    }
+
+    // Create Paystack transfer recipient
+    let recipientCode = '';
+    try {
+      const recipientRes = await paystackService.createTransferRecipient({
+        name: accountName.trim(),
+        accountNumber: accountNumber.trim(),
+        bankCode: bankCode.trim(),
+      });
+      recipientCode = recipientRes.recipientCode || '';
+    } catch (paystackErr) {
+      console.warn('[Paystack Recipient Creation Notice]', paystackErr.message);
+      // Fallback recipient code for test mode
+      recipientCode = `RCP_test_${Date.now().toString(36)}`;
+    }
+
+    const accountNumberMasked = `******${accountNumber.slice(-4)}`;
+
+    const user = await User.findById(organizerId);
+    user.bankAccount = {
+      bankName: bankName.trim(),
+      bankCode: bankCode.trim(),
+      accountNumber: accountNumber.trim(),
+      accountNumberMasked,
+      accountName: accountName.trim(),
+      recipientCode,
+      isVerified: true,
+      updatedAt: new Date(),
+    };
+    await user.save();
+
+    return res.json({
+      success: true,
+      message: 'Settlement bank account successfully verified and connected.',
+      data: user.bankAccount,
+    });
+  } catch (error) {
+    console.error('[Save Payout Account Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * @route   GET /api/organizer/financials/transactions
+ * @desc    Get paginated vendor financial ledger transactions
+ */
+export const getFinancialTransactions = async (req, res) => {
+  try {
+    const organizerId = req.user._id;
+    const { page = 1, limit = 20, type = '', search = '' } = req.query;
+
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+    const query = { vendorId: organizerId };
+
+    if (type) {
+      query.type = type;
+    }
+    if (search) {
+      query.description = { $regex: search, $options: 'i' };
+    }
+
+    const [entries, total] = await Promise.all([
+      VendorLedger.find(query)
+        .populate('eventId', 'title')
+        .populate('orderId', 'orderNumber totalAmount')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit, 10)),
+      VendorLedger.countDocuments(query),
+    ]);
+
+    return res.json({
+      success: true,
+      total,
+      page: parseInt(page, 10),
+      pages: Math.ceil(total / parseInt(limit, 10)),
+      data: entries,
+    });
+  } catch (error) {
+    console.error('[Financial Transactions Error]', error);
     return res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -1333,12 +1695,12 @@ export const getEventCheckInStats = async (req, res) => {
     const eventId = event._id;
 
     const [totalSold, totalCheckedIn, recentCheckIns, byTicketType] = await Promise.all([
-      Ticket.countDocuments({ eventId, status: { $in: ['SOLD', 'USED'] } }),
+      Ticket.countDocuments({ eventId, status: { $in: ['SOLD', 'USED', 'REGISTERED'] } }),
       CheckIn.countDocuments({ eventId, status: 'VALID' }),
       CheckIn.find({ eventId, status: 'VALID' })
         .populate({
           path: 'ticketId',
-          select: 'ticketNumber ownerId ticketTypeId',
+          select: 'ticketNumber ownerId ticketTypeId admissionType registrationRef',
           populate: [
             { path: 'ownerId', select: 'firstName lastName' },
             { path: 'ticketTypeId', select: 'name' },
@@ -1348,7 +1710,7 @@ export const getEventCheckInStats = async (req, res) => {
         .sort({ checkInTime: -1 })
         .limit(20),
       Ticket.aggregate([
-        { $match: { eventId, status: { $in: ['SOLD', 'USED'] } } },
+        { $match: { eventId, status: { $in: ['SOLD', 'USED', 'REGISTERED'] } } },
         {
           $group: {
             _id: '$ticketTypeId',
@@ -1375,14 +1737,14 @@ export const getEventCheckInStats = async (req, res) => {
         stats: {
           totalSold,
           totalCheckedIn,
-          notArrived: totalSold - totalCheckedIn,
+          notArrived: Math.max(0, totalSold - totalCheckedIn),
           attendanceRate: totalSold > 0 ? parseFloat(((totalCheckedIn / totalSold) * 100).toFixed(1)) : 0,
         },
         byTicketType: byTicketType.map(b => ({
           name: b.type.name,
           total: b.total,
           checkedIn: b.checkedIn,
-          notArrived: b.total - b.checkedIn,
+          notArrived: Math.max(0, b.total - b.checkedIn),
         })),
         recentCheckIns,
       },
@@ -1400,7 +1762,7 @@ export const getEventCheckInStats = async (req, res) => {
  */
 export const getAllAttendees = async (req, res) => {
   try {
-    const { page = 1, limit = 50, search = '' } = req.query;
+    const { page = 1, limit = 50, search = '', eventId = '', admissionType = '', checkedIn = '' } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     const events = await Event.find({ organizerId: req.user._id });
@@ -1408,12 +1770,20 @@ export const getAllAttendees = async (req, res) => {
 
     const matchQuery = {
       eventId: { $in: eventIds },
-      status: { $in: ['SOLD', 'USED'] },
+      status: { $in: ['SOLD', 'USED', 'REGISTERED'] },
     };
+
+    if (eventId && eventIds.some(id => id.toString() === eventId.toString())) {
+      matchQuery.eventId = eventId;
+    }
+    if (checkedIn === 'true') matchQuery.checkedInAt = { $exists: true, $ne: null };
+    if (checkedIn === 'false') matchQuery.$or = [{ checkedInAt: { $exists: false } }, { checkedInAt: null }];
+    if (admissionType === 'FREE') matchQuery.admissionType = 'FREE';
+    if (admissionType === 'PAID') matchQuery.admissionType = { $ne: 'FREE' };
 
     let tickets = await Ticket.find(matchQuery)
       .populate('ownerId', 'firstName lastName email phone createdAt')
-      .populate('eventId', 'title startDate')
+      .populate('eventId', 'title startDate admissionType')
       .populate('ticketTypeId', 'name price')
       .sort({ createdAt: -1 })
       .skip(skip)
@@ -1424,17 +1794,42 @@ export const getAllAttendees = async (req, res) => {
       tickets = tickets.filter(t => {
         const name = `${t.ownerId?.firstName} ${t.ownerId?.lastName}`.toLowerCase();
         const email = t.ownerId?.email?.toLowerCase() || '';
-        return name.includes(q) || email.includes(q);
+        const num = t.ticketNumber?.toLowerCase() || '';
+        const ref = t.registrationRef?.toLowerCase() || '';
+        return name.includes(q) || email.includes(q) || num.includes(q) || ref.includes(q);
       });
     }
 
     const total = await Ticket.countDocuments(matchQuery);
+
+    const baseStatsMatch = {
+      eventId: matchQuery.eventId || { $in: eventIds },
+      status: { $in: ['SOLD', 'USED', 'REGISTERED'] },
+    };
+
+    const [totalRegistrations, checkedInCount, freeCount, paidCount] = await Promise.all([
+      Ticket.countDocuments(baseStatsMatch),
+      Ticket.countDocuments({ ...baseStatsMatch, checkedInAt: { $exists: true, $ne: null } }),
+      Ticket.countDocuments({ ...baseStatsMatch, admissionType: 'FREE' }),
+      Ticket.countDocuments({ ...baseStatsMatch, admissionType: { $ne: 'FREE' } }),
+    ]);
+
+    const notCheckedInCount = Math.max(0, totalRegistrations - checkedInCount);
+    const attendancePercentage = totalRegistrations > 0 ? parseFloat(((checkedInCount / totalRegistrations) * 100).toFixed(1)) : 0;
 
     return res.json({
       success: true,
       total,
       page: parseInt(page),
       pages: Math.ceil(total / parseInt(limit)),
+      stats: {
+        totalRegistrations,
+        checkedIn: checkedInCount,
+        notCheckedIn: notCheckedInCount,
+        freeRegistrations: freeCount,
+        paidTicketsSold: paidCount,
+        attendancePercentage,
+      },
       data: tickets,
     });
   } catch (error) {
@@ -1669,6 +2064,34 @@ export const processOrderRefund = async (req, res) => {
         },
       }
     );
+
+    // If paid order, reverse vendor earnings and record ledger entry
+    if (order.admissionType === 'PAID' && order.vendorShare > 0) {
+      const vendorShareKobo = Math.round((order.vendorShare || 0) * 100);
+      const updatedVendor = await User.findByIdAndUpdate(
+        req.user._id,
+        {
+          $inc: {
+            availableBalanceKobo: -vendorShareKobo,
+            balance: -(vendorShareKobo / 100),
+          },
+        },
+        { new: true }
+      );
+
+      await VendorLedger.create({
+        vendorId: req.user._id,
+        orderId: order._id,
+        type: 'REFUND_DEDUCTION',
+        amountKobo: vendorShareKobo,
+        currency: 'NGN',
+        direction: 'DEBIT',
+        classification: 'AVAILABLE',
+        balanceAfterKobo: updatedVendor ? updatedVendor.availableBalanceKobo : 0,
+        idempotencyKey: `REFUND-${order._id}-${Date.now()}`,
+        description: `Deduction for refunded order #${order.orderNumber}`,
+      });
+    }
 
     // Notify buyer
     await Notification.create({

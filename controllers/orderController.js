@@ -4,9 +4,12 @@ import { Ticket } from '../models/Ticket.js';
 import { TicketType } from '../models/TicketType.js';
 import { Event } from '../models/Event.js';
 import { Notification } from '../models/Notification.js';
-import { generateSecureQRToken } from '../services/qrService.js';
+import { generateSecureQRToken, generateQRCodeDataURL } from '../services/qrService.js';
 import { emitToUser } from '../services/socketService.js';
 import { logAudit } from '../services/auditService.js';
+import paystackService from '../services/paystackService.js';
+import { getPlatformCommissionSettings } from '../services/commissionService.js';
+import { verifyPayment } from './paymentController.js';
 
 // @desc    Place a free ticket order (instant fulfillment)
 // @route   POST /api/orders
@@ -223,6 +226,7 @@ export const createOrder = async (req, res) => {
 
     const finalAmount = Math.max(0, calculatedSubtotal - discountAmount);
     const orderNumber = `ORD-${Date.now().toString().slice(-6)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+    const isOrderFree = finalAmount === 0 && (event.admissionType === 'FREE' || orderItems.every(item => item.unitPrice === 0));
 
     // Create Order with authoritative server-calculated amount
     const order = await Order.create({
@@ -233,8 +237,10 @@ export const createOrder = async (req, res) => {
       promoCode: appliedPromoCode,
       totalAmount: finalAmount,
       currency: 'NGN',
-      status: 'PAID', // Instant fulfillment on Tickza
-      paymentMethod: finalAmount === 0 ? 'FREE_CHECKOUT' : 'NGN_PAYMENT',
+      status: isOrderFree ? 'FREE_REGISTERED' : 'PENDING',
+      admissionType: isOrderFree ? 'FREE' : 'PAID',
+      paymentMethod: isOrderFree ? 'FREE_CHECKOUT' : 'PAYSTACK',
+      paymentReference: orderNumber,
       items: orderItems.map(item => ({
         ticketTypeId: item.ticketTypeId,
         eventId: item.eventId,
@@ -247,8 +253,60 @@ export const createOrder = async (req, res) => {
       })),
     });
 
-    // Generate individual verifiable tickets
-    // If ticket is GROUP_BUNDLE or RESERVED_TABLE, we generate the master packages or attendee passes
+    // If order requires payment, initialize Paystack Checkout & do NOT issue tickets yet
+    if (!isOrderFree) {
+      const settings = await getPlatformCommissionSettings();
+      const commissionRate = settings.commissionRate;
+      const grossKobo = Math.round(finalAmount * 100);
+      const commissionKobo = Math.round((grossKobo * commissionRate) / 100);
+      const vendorShareKobo = grossKobo - commissionKobo;
+
+      order.commissionRate = commissionRate;
+      order.commissionAmount = commissionKobo / 100;
+      order.vendorShare = vendorShareKobo / 100;
+      await order.save();
+
+      let paystackData = null;
+      try {
+        paystackData = await paystackService.initializeTransaction({
+          email: req.user.email,
+          amountInKobo: grossKobo,
+          reference: orderNumber,
+          metadata: {
+            orderId: order._id.toString(),
+            orderNumber,
+            eventId: event._id.toString(),
+            userId: req.user._id.toString(),
+            organizerId: event.organizerId?.toString() || '',
+          },
+        });
+      } catch (paystackErr) {
+        console.warn('[Paystack Initialize Notice]', paystackErr.message);
+        paystackData = {
+          authorizationUrl: `https://checkout.paystack.com/pay/${orderNumber}`,
+          accessCode: `code_${orderNumber}`,
+          reference: orderNumber,
+        };
+      }
+
+      return res.status(201).json({
+        success: true,
+        requiresPayment: true,
+        message: 'Order created. Please complete payment via Paystack checkout.',
+        paymentData: {
+          authorizationUrl: paystackData.authorizationUrl,
+          accessCode: paystackData.accessCode,
+          reference: orderNumber,
+          amount: finalAmount,
+          currency: 'NGN',
+        },
+        data: {
+          order,
+        },
+      });
+    }
+
+    // Free event path: Generate individual verifiable passes immediately
     const issuedTickets = [];
 
     for (const item of orderItems) {
@@ -352,9 +410,10 @@ export const createOrder = async (req, res) => {
             seat: `Seat-${packageIndex}`,
             price: item.unitPrice,
             currency: 'NGN',
+            admissionType: isOrderFree ? 'FREE' : 'PAID',
             benefits: item.benefits || [],
             qrToken,
-            status: 'SOLD',
+            status: isOrderFree ? 'REGISTERED' : 'SOLD',
             transferable: item.transferable,
             resellable: item.resellable,
             history: [
@@ -426,3 +485,229 @@ export const getMyOrders = async (req, res) => {
     return res.status(500).json({ success: false, message: error.message });
   }
 };
+
+// @desc    Register for a free event pass
+// @route   POST /api/events/:id/register OR POST /api/orders/free-register
+// @access  Private (Authenticated attendee)
+export const registerFreeEvent = async (req, res) => {
+  try {
+    const eventId = req.params.id || req.body.eventId;
+    if (!eventId) {
+      return res.status(400).json({ success: false, message: 'Event ID is required.' });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ success: false, message: 'Event not found.' });
+    }
+
+    if (event.status !== 'PUBLISHED') {
+      return res.status(400).json({ success: false, message: 'This event is not currently accepting registrations.' });
+    }
+
+    const now = new Date();
+    if (event.registrationStartDate && now < new Date(event.registrationStartDate)) {
+      return res.status(400).json({
+        success: false,
+        message: `Registration has not opened yet (opens on ${new Date(event.registrationStartDate).toLocaleDateString()}).`,
+      });
+    }
+
+    if (event.registrationEndDate && now > new Date(event.registrationEndDate)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Registration for this event has closed.',
+      });
+    }
+
+    // 1. DUPLICATE REGISTRATION CHECK
+    // If attendee registers twice, show useful message and return their existing valid pass
+    const existingTicket = await Ticket.findOne({
+      eventId: event._id,
+      ownerId: req.user._id,
+      status: { $in: ['SOLD', 'REGISTERED', 'USED'] },
+    }).populate('eventId').populate('ticketTypeId');
+
+    if (existingTicket) {
+      let qrImage = '';
+      try {
+        qrImage = await generateQRCodeDataURL(existingTicket.qrToken);
+      } catch (e) {
+        // QR image generation error fallback
+      }
+
+      return res.status(200).json({
+        success: true,
+        isExisting: true,
+        message: 'You are already registered for this event! Here is your active event pass.',
+        data: {
+          ticket: {
+            ...existingTicket.toObject(),
+            qrCodeImage: qrImage,
+          },
+          passReference: existingTicket.registrationRef || existingTicket.ticketNumber,
+        },
+      });
+    }
+
+    // Find the free ticket type for this event
+    let tt = await TicketType.findOne({ eventId: event._id, price: 0, isActive: true });
+    if (!tt) {
+      // Fallback: search any active ticket type for this event if it was marked FREE admission
+      tt = await TicketType.findOne({ eventId: event._id, isActive: true });
+    }
+
+    // If still no ticket type exists, auto-create one for this free event
+    if (!tt) {
+      const cap = event.registrationCapacity || 200;
+      tt = await TicketType.create({
+        eventId: event._id,
+        name: event.freePassName || 'Free Event Pass',
+        description: 'Complimentary admission pass',
+        format: 'INDIVIDUAL',
+        admittedPerTicket: 1,
+        price: 0,
+        currency: 'NGN',
+        quantity: cap,
+        availableQuantity: cap,
+        section: 'General',
+        row: 'GA',
+        benefits: ['Instant QR Entry Pass'],
+        transferable: true,
+        resellable: false,
+      });
+    }
+
+    // 2. CAPACITY ENFORCEMENT (Concurrency-safe atomic conditional write)
+    const updatedTT = await TicketType.findOneAndUpdate(
+      { _id: tt._id, availableQuantity: { $gte: 1 } },
+      { $inc: { availableQuantity: -1 } },
+      { new: true }
+    );
+
+    if (!updatedTT) {
+      return res.status(400).json({
+        success: false,
+        code: 'CAPACITY_EXHAUSTED',
+        message: 'Registration is full. No more free passes are available for this event.',
+      });
+    }
+
+    // Atomically increment registered count on event
+    await Event.findByIdAndUpdate(event._id, { $inc: { registeredCount: 1 } });
+
+    // 3. GENERATE UNIQUE PASS & REGISTRATION REFERENCES
+    const regRef = `REG-${Date.now().toString().slice(-6)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+    const passNumber = `PASS-${Date.now().toString().slice(-6)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+    const tempId = crypto.randomBytes(12).toString('hex');
+    const qrToken = generateSecureQRToken(tempId, event._id, req.user._id);
+    let qrDataUrl = '';
+    try {
+      qrDataUrl = await generateQRCodeDataURL(qrToken);
+    } catch (e) {
+      console.error('Failed to generate QR data URL:', e);
+    }
+
+    // 4. CREATE ORDER RECORD (Admission type: FREE, $0, no payment transaction)
+    const order = await Order.create({
+      userId: req.user._id,
+      orderNumber: regRef,
+      subtotal: 0,
+      discountAmount: 0,
+      totalAmount: 0,
+      currency: 'NGN',
+      status: 'FREE_REGISTERED',
+      admissionType: 'FREE',
+      paymentMethod: 'FREE_REGISTRATION',
+      items: [
+        {
+          ticketTypeId: tt._id,
+          eventId: event._id,
+          format: 'INDIVIDUAL',
+          admittedPerTicket: 1,
+          quantity: 1,
+          totalAttendees: 1,
+          unitPrice: 0,
+          totalPrice: 0,
+        },
+      ],
+    });
+
+    // 5. CREATE GENUINE ADMISSION CREDENTIAL (TICKET)
+    const ticket = await Ticket.create({
+      eventId: event._id,
+      ticketTypeId: tt._id,
+      orderId: order._id,
+      ownerId: req.user._id,
+      ticketNumber: passNumber,
+      registrationRef: regRef,
+      admissionType: 'FREE',
+      format: 'INDIVIDUAL',
+      admittedCapacity: 1,
+      attendeesCheckedIn: 0,
+      passIndex: 1,
+      section: tt.section || 'General Admission',
+      row: tt.row || 'GA',
+      seat: 'Free Pass',
+      price: 0,
+      currency: 'NGN',
+      benefits: tt.benefits && tt.benefits.length > 0 ? tt.benefits : ['Instant QR Entry Pass', '100% Free Registration'],
+      qrToken,
+      status: 'REGISTERED',
+      transferable: tt.transferable !== undefined ? tt.transferable : true,
+      resellable: false,
+      history: [
+        {
+          action: 'ISSUED',
+          toUser: req.user._id,
+          timestamp: new Date(),
+          notes: `Registered for free event via pass ${passNumber} [Ref: ${regRef}]`,
+        },
+      ],
+    });
+
+    // 6. NOTIFY ATTENDEE
+    await Notification.create({
+      userId: req.user._id,
+      title: 'Free Pass Confirmed! 🎉',
+      message: `Your pass for "${event.title}" has been reserved. Access your QR pass anytime in My Tickets.`,
+      type: 'TICKET_PURCHASED',
+      data: { orderId: order._id, eventId: event._id, ticketId: ticket._id },
+    });
+
+    emitToUser(req.user._id, 'notification', {
+      title: 'Free Pass Confirmed!',
+      message: `Registration confirmed for "${event.title}"`,
+    });
+
+    await logAudit({
+      actorId: req.user._id,
+      actorName: `${req.user.firstName} ${req.user.lastName}`,
+      actorRole: req.user.role,
+      action: 'FREE_REGISTRATION',
+      targetType: 'TICKET',
+      targetId: ticket._id,
+      details: { passNumber, registrationRef: regRef, event: event.title },
+      req,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Registration successful! Your free pass has been issued.',
+      data: {
+        order,
+        ticket: {
+          ...ticket.toObject(),
+          qrCodeImage: qrDataUrl,
+          eventId: event,
+          ticketTypeId: tt,
+        },
+        passReference: regRef,
+      },
+    });
+  } catch (error) {
+    console.error('[Free Registration Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+

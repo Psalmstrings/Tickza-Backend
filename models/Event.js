@@ -103,6 +103,40 @@ const eventSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    admissionType: {
+      type: String,
+      enum: ['PAID', 'FREE'],
+      default: 'PAID',
+      index: true,
+    },
+    registrationCapacity: {
+      type: Number,
+      default: null,
+    },
+    registeredCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    registrationStartDate: {
+      type: Date,
+      default: null,
+    },
+    registrationEndDate: {
+      type: Date,
+      default: null,
+    },
+    freePassName: {
+      type: String,
+      default: 'Free Event Pass',
+    },
+    registrationFields: [
+      {
+        label: { type: String, required: true },
+        required: { type: Boolean, default: false },
+        fieldType: { type: String, default: 'text' },
+      },
+    ],
   },
   {
     timestamps: true,

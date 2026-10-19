@@ -11,6 +11,7 @@ import {
   deleteOrganizerEvent,
   validatePromoCode,
 } from '../controllers/organizerController.js';
+import { registerFreeEvent } from '../controllers/orderController.js';
 import { protect, requireApproved } from '../middleware/authMiddleware.js';
 import { upload } from '../middleware/uploadMiddleware.js';
 
@@ -42,6 +43,9 @@ router.put('/:id', protect, requireApproved, updateOrganizerEvent);
 
 // @route   DELETE /api/events/:id    — Private (Approved): safely delete or archive event
 router.delete('/:id', protect, requireApproved, deleteOrganizerEvent);
+
+// @route   POST /api/events/:id/register — Private: free event attendee registration
+router.post('/:id/register', protect, registerFreeEvent);
 
 // @route   POST /api/events/:id/validate-promo — Public/buyer promo validation
 router.post('/:id/validate-promo', validatePromoCode);

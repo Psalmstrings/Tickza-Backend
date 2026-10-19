@@ -8,8 +8,12 @@ import { logAudit } from '../services/auditService.js';
 // @access  Public
 export const getEvents = async (req, res) => {
   try {
-    const { search, category, city, date, featured, sort } = req.query;
+    const { search, category, city, date, featured, sort, admissionType } = req.query;
     const query = { status: 'PUBLISHED' };
+
+    if (admissionType && (admissionType.toUpperCase() === 'FREE' || admissionType.toUpperCase() === 'PAID')) {
+      query.admissionType = admissionType.toUpperCase();
+    }
 
     if (category && category !== 'All' && category !== 'all') {
       // Map category labels if needed
@@ -86,8 +90,11 @@ export const getEvents = async (req, res) => {
       const prices = types.map(t => t.price).filter(p => typeof p === 'number');
       const minPrice = prices.length > 0 ? Math.min(...prices) : 0;
       const maxPrice = prices.length > 0 ? Math.max(...prices) : 0;
+      const isFree = ev.admissionType === 'FREE' || (prices.length > 0 && maxPrice === 0);
       return {
         ...ev.toObject(),
+        admissionType: ev.admissionType || (isFree ? 'FREE' : 'PAID'),
+        isFree,
         ticketTypes: types,
         minPrice,
         maxPrice,
@@ -119,11 +126,14 @@ export const getEventById = async (req, res) => {
     }
 
     const ticketTypes = await TicketType.find({ eventId: event._id });
+    const isFree = event.admissionType === 'FREE' || (ticketTypes.length > 0 && ticketTypes.every(t => (t.price || 0) === 0));
 
     return res.json({
       success: true,
       data: {
         ...event.toObject(),
+        admissionType: event.admissionType || (isFree ? 'FREE' : 'PAID'),
+        isFree,
         ticketTypes,
       },
     });
@@ -167,11 +177,19 @@ export const createEvent = async (req, res) => {
       seatMapUrl,
       ticketTypes,
       status,
+      admissionType = 'PAID',
+      registrationCapacity,
+      registrationStartDate,
+      registrationEndDate,
+      freePassName,
+      registrationFields,
     } = req.body;
 
     if (!title || !startDate || !venue) {
       return res.status(400).json({ success: false, message: 'Title, start date, and venue are required.' });
     }
+
+    const isFreeEvent = String(admissionType).toUpperCase() === 'FREE';
 
     let finalCoverImageUrl = coverImageUrl || req.body.coverImage?.url || (typeof req.body.coverImage === 'string' ? req.body.coverImage : '');
     const coverImage = finalCoverImageUrl
@@ -182,6 +200,8 @@ export const createEvent = async (req, res) => {
         };
 
     const seatMap = (seatMapUrl || req.body.seatMap?.url) ? { url: seatMapUrl || req.body.seatMap?.url, publicId: 'seatmap' } : null;
+
+    const parsedCapacity = registrationCapacity ? Math.max(1, parseInt(registrationCapacity, 10)) : (isFreeEvent ? 200 : null);
 
     const event = await Event.create({
       organizerId: req.user._id,
@@ -204,11 +224,39 @@ export const createEvent = async (req, res) => {
       multiDay: Boolean(multiDay),
       countdownEnabled: countdownEnabled !== undefined ? Boolean(countdownEnabled) : true,
       status: status || 'PUBLISHED',
+      admissionType: isFreeEvent ? 'FREE' : 'PAID',
+      registrationCapacity: parsedCapacity,
+      registeredCount: 0,
+      registrationStartDate: registrationStartDate ? new Date(registrationStartDate) : null,
+      registrationEndDate: registrationEndDate ? new Date(registrationEndDate) : null,
+      freePassName: (freePassName && freePassName.trim()) ? freePassName.trim() : 'Free Event Pass',
+      registrationFields: Array.isArray(registrationFields) ? registrationFields : [],
     });
 
-    // Create ticket types if provided
+    // Create ticket types
     let createdTicketTypes = [];
-    if (ticketTypes && Array.isArray(ticketTypes) && ticketTypes.length > 0) {
+    if (isFreeEvent) {
+      // Vendor created a free event: generate the complimentary pass tier automatically
+      const passName = (freePassName && freePassName.trim()) ? freePassName.trim() : 'Free Event Pass';
+      const cap = parsedCapacity || 200;
+      const freeTier = await TicketType.create({
+        eventId: event._id,
+        name: passName,
+        description: 'Complimentary general admission pass',
+        format: 'INDIVIDUAL',
+        admittedPerTicket: 1,
+        price: 0,
+        currency: 'NGN',
+        quantity: cap,
+        availableQuantity: cap,
+        section: 'General',
+        row: 'GA',
+        benefits: ['Instant QR Entry Pass', '100% Free Registration'],
+        transferable: true,
+        resellable: false,
+      });
+      createdTicketTypes.push(freeTier);
+    } else if (ticketTypes && Array.isArray(ticketTypes) && ticketTypes.length > 0) {
       const typesToInsert = ticketTypes.map((tt) => {
         const qty = tt.quantity ? parseInt(tt.quantity, 10) : 100;
         const validFormats = ['INDIVIDUAL', 'GROUP_BUNDLE', 'RESERVED_TABLE', 'CUSTOM'];
@@ -247,7 +295,7 @@ export const createEvent = async (req, res) => {
       });
       createdTicketTypes = await TicketType.insertMany(typesToInsert);
     } else {
-      // Default ticket type
+      // Default ticket type for paid event
       const defaultType = await TicketType.create({
         eventId: event._id,
         name: 'General Admission',

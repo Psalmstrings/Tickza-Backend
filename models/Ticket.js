@@ -107,6 +107,7 @@ const ticketSchema = new mongoose.Schema(
         'AVAILABLE',
         'RESERVED',
         'SOLD',
+        'REGISTERED',
         'TRANSFER_PENDING',
         'TRANSFERRED',
         'LISTED',
@@ -116,6 +117,17 @@ const ticketSchema = new mongoose.Schema(
         'REFUNDED',
       ],
       default: 'SOLD',
+      index: true,
+    },
+    admissionType: {
+      type: String,
+      enum: ['PAID', 'FREE'],
+      default: 'PAID',
+      index: true,
+    },
+    registrationRef: {
+      type: String,
+      default: '',
       index: true,
     },
     transferable: {

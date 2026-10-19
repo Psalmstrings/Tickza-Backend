@@ -50,6 +50,29 @@ const userSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    // Available vendor balance stored in minor units (kobo)
+    availableBalanceKobo: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    // Locked balance awaiting payout approval
+    reservedBalanceKobo: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    // Verified payout bank details
+    bankAccount: {
+      bankName: { type: String, default: '' },
+      bankCode: { type: String, default: '' },
+      accountNumber: { type: String, default: '' },
+      accountNumberMasked: { type: String, default: '' },
+      accountName: { type: String, default: '' },
+      recipientCode: { type: String, default: '' },
+      isVerified: { type: Boolean, default: false },
+      updatedAt: { type: Date, default: null },
+    },
     emailVerified: {
       type: Boolean,
       default: true,

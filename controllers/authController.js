@@ -52,7 +52,7 @@ export const register = async (req, res) => {
     // Create welcoming notification
     await Notification.create({
       userId: user._id,
-      title: 'Welcome to TickApp!',
+      title: 'Welcome to Tickza!',
       message: 'Your account has been created and is currently awaiting admin approval to create and transfer tickets.',
       type: 'ACCOUNT_CREATED',
     });
@@ -289,7 +289,7 @@ export const topUpBalance = async (req, res) => {
     await Notification.create({
       userId: user._id,
       title: 'Wallet Funded 💳',
-      message: `Successfully added $${numAmount.toFixed(2)} to your TickApp wallet. New balance: $${user.balance.toFixed(2)}`,
+      message: `Successfully added ₦${numAmount.toLocaleString()} to your Tickza wallet. New balance: ₦${(user.balance || 0).toLocaleString()}`,
       type: 'PAYMENT_RECEIVED',
     });
 

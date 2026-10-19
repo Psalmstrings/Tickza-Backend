@@ -24,6 +24,11 @@ import {
   updateTeamMember,
   removeTeamMember,
   getPayouts,
+  requestPayout,
+  getPayoutBanks,
+  resolvePayoutAccount,
+  savePayoutAccount,
+  getFinancialTransactions,
   getEventCheckInStats,
   getAllAttendees,
   organizerSearch,
@@ -89,7 +94,12 @@ router.post('/team',                inviteTeamMember);
 router.put('/team/:memberId',       updateTeamMember);
 router.delete('/team/:memberId',    removeTeamMember);
 
-// ── Payouts ───────────────────────────────────────────────────────────────────
-router.get('/payouts',              getPayouts);
+// ── Payouts & Financials ──────────────────────────────────────────────────────
+router.get('/payouts',                    getPayouts);
+router.post('/payouts/request',           requestPayout);
+router.get('/payouts/banks',              getPayoutBanks);
+router.post('/payouts/resolve-account',   resolvePayoutAccount);
+router.post('/payouts/bank-account',      savePayoutAccount);
+router.get('/financials/transactions',    getFinancialTransactions);
 
 export default router;
