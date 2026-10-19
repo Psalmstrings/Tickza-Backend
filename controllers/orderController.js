@@ -608,7 +608,7 @@ export const registerFreeEvent = async (req, res) => {
       console.error('Failed to generate QR data URL:', e);
     }
 
-    // 4. CREATE ORDER RECORD (Admission type: FREE, $0, no payment transaction)
+    // 4. CREATE ORDER RECORD (Admission type: FREE, ₦0, no payment transaction)
     const order = await Order.create({
       userId: req.user._id,
       orderNumber: regRef,

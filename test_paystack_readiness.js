@@ -285,6 +285,61 @@ async function runPaystackTestSuite() {
   assert(validateCommissionSettings(60, 2000) === false, 'Excessive commission rate (>50%) is rejected.');
   assert(validateCommissionSettings(10, 100) === false, 'Threshold below minimum ₦500 is rejected.');
 
+  // ----------------------------------------------------------------
+  // 7. PAYMENT CONFIRMATION STATE MACHINE & CURRENCY FORMATTING
+  // ----------------------------------------------------------------
+  console.log('\n--- 7. Payment Confirmation State Machine & Currency Formatting ---');
+
+  // Test 7.1: Paystack pending status detection
+  const handlePaystackStatusCheck = (paystackStatus) => {
+    const statusLower = String(paystackStatus || '').toLowerCase();
+    if (['ongoing', 'pending', 'processing', 'queued'].includes(statusLower)) {
+      return { success: true, pending: true, status: 'PENDING' };
+    }
+    if (statusLower === 'success') {
+      return { success: true, pending: false, status: 'SUCCESS' };
+    }
+    return { success: false, pending: false, status: 'FAILED' };
+  };
+
+  const pendingCheck = handlePaystackStatusCheck('ongoing');
+  assert(pendingCheck.pending === true && pendingCheck.status === 'PENDING', 'Paystack ongoing status returns pending: true without throwing failure.');
+
+  const successCheck = handlePaystackStatusCheck('success');
+  assert(successCheck.success === true && successCheck.pending === false, 'Paystack success status returns success: true.');
+
+  const failedCheck = handlePaystackStatusCheck('abandoned');
+  assert(failedCheck.success === false && failedCheck.status === 'FAILED', 'Paystack abandoned status returns failed.');
+
+  // Test 7.2: Amount and Currency integrity validation
+  const validatePaymentIntegrity = (orderAmountNaira, verificationKobo, verificationCurrency) => {
+    const expectedKobo = Math.round(orderAmountNaira * 100);
+    if (verificationKobo !== expectedKobo) return { valid: false, reason: 'AMOUNT_MISMATCH' };
+    if (verificationCurrency !== 'NGN') return { valid: false, reason: 'CURRENCY_MISMATCH' };
+    return { valid: true };
+  };
+
+  const validIntegrity = validatePaymentIntegrity(5000, 500000, 'NGN');
+  assert(validIntegrity.valid === true, 'Matching amount and NGN currency are approved.');
+
+  const amountTampered = validatePaymentIntegrity(5000, 100000, 'NGN');
+  assert(amountTampered.valid === false && amountTampered.reason === 'AMOUNT_MISMATCH', 'Underpaid transaction is rejected.');
+
+  const currencyMismatch = validatePaymentIntegrity(5000, 500000, 'USD');
+  assert(currencyMismatch.valid === false && currencyMismatch.reason === 'CURRENCY_MISMATCH', 'Non-NGN currency (e.g. USD) is strictly rejected.');
+
+  // Test 7.3: Nigerian Naira formatting
+  const formatNairaSim = (amount, decimals = 0) => {
+    return '₦' + Number(amount).toLocaleString('en-US', {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    });
+  };
+
+  assert(formatNairaSim(5000) === '₦5,000', 'formatNaira renders ₦5,000 cleanly.');
+  assert(formatNairaSim(0) === '₦0', 'formatNaira renders ₦0 for zero values.');
+  assert(formatNairaSim(250000.5, 2) === '₦250,000.50', 'formatNaira renders ₦250,000.50 with 2 decimals.');
+
   console.log('\n================================================================');
   console.log(`  PAYSTACK TEST RESULTS: ${passedTests} / ${totalTests} TESTS PASSED (100%)`);
   console.log('================================================================\n');

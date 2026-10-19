@@ -88,7 +88,7 @@ export const listForResale = async (req, res) => {
       action:    'LISTED_RESALE',
       fromUser:  req.user._id,
       timestamp: new Date(),
-      notes:     `Listed for resale at $${resalePrice}`,
+      notes:     `Listed for resale at ₦${resalePrice.toLocaleString()}`,
     });
     await ticket.save();
 
@@ -199,7 +199,7 @@ export const buyResaleTicket = async (req, res) => {
       fromUser:  previousOwnerId,
       toUser:    req.user._id,
       timestamp: new Date(),
-      notes:     `Resold via listing ${listing._id} at $${listing.price}`,
+      notes:     `Resold via listing ${listing._id} at ₦${listing.price.toLocaleString()}`,
     });
     await ticket.save();
 

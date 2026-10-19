@@ -306,7 +306,7 @@ export const topUpBalance = async (req, res) => {
 
     return res.json({
       success: true,
-      message: `Added $${numAmount.toFixed(2)} to your balance`,
+      message: `Added ₦${numAmount.toLocaleString()} to your balance`,
       balance: user.balance,
       user: {
         id: user._id,

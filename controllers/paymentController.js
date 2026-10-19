@@ -237,7 +237,13 @@ export const verifyPayment = async (req, res) => {
 
     // 2. Idempotency Check: if already paid, return existing tickets immediately
     if (order.status === 'PAID') {
-      const existingTickets = await Ticket.find({ orderId: order._id });
+      let existingTickets = await Ticket.find({ orderId: order._id });
+      // If order is marked PAID but tickets are still being issued by a concurrent process:
+      if (!existingTickets || existingTickets.length === 0) {
+        const buyer = await User.findById(order.userId);
+        const primaryEvent = order.items[0]?.eventId;
+        existingTickets = await issueTicketsForOrder(order, buyer, primaryEvent);
+      }
       return res.json({
         success: true,
         alreadyProcessed: true,
@@ -251,6 +257,18 @@ export const verifyPayment = async (req, res) => {
 
     // 3. Verify directly with Paystack API
     const verification = await paystackService.verifyTransaction(reference);
+
+    // Check for ongoing / pending states from Paystack
+    const statusLower = String(verification.status || '').toLowerCase();
+    if (['ongoing', 'pending', 'processing', 'queued'].includes(statusLower)) {
+      return res.json({
+        success: true,
+        pending: true,
+        status: 'PENDING',
+        message: 'Payment is currently being processed by your bank. Awaiting final settlement confirmation.',
+        details: verification.gatewayResponse || 'Processing',
+      });
+    }
 
     if (!verification.isSuccessful) {
       return res.status(400).json({
@@ -297,43 +315,55 @@ export const verifyPayment = async (req, res) => {
     const primaryEvent = order.items[0]?.eventId;
     const organizerId = primaryEvent?.organizerId;
 
-    // 7. Record PaymentTransaction
-    let transaction = null;
-    if (organizerId) {
-      transaction = await PaymentTransaction.create({
-        reference,
-        orderId: order._id,
-        eventId: primaryEvent._id,
-        organizerId,
-        customerId: order.userId,
-        grossAmountKobo: grossKobo,
-        currency: 'NGN',
-        commissionRate,
-        commissionAmountKobo: commissionKobo,
-        paystackFeeKobo: verification.fees || 0,
-        vendorNetShareKobo: vendorShareKobo,
-        status: 'SUCCESS',
-        channel: verification.channel || 'paystack',
-        gatewayResponse: verification.gatewayResponse || 'Successful',
-        paidAt: order.paidAt,
-        metadata: verification.metadata,
-      });
+    // 7. Record PaymentTransaction (guarded against concurrent webhook race conditions)
+    let transaction = await PaymentTransaction.findOne({ reference });
+    if (!transaction && organizerId) {
+      try {
+        transaction = await PaymentTransaction.create({
+          reference,
+          orderId: order._id,
+          eventId: primaryEvent._id,
+          organizerId,
+          customerId: order.userId,
+          grossAmountKobo: grossKobo,
+          currency: 'NGN',
+          commissionRate,
+          commissionAmountKobo: commissionKobo,
+          paystackFeeKobo: verification.fees || 0,
+          vendorNetShareKobo: vendorShareKobo,
+          status: 'SUCCESS',
+          channel: verification.channel || 'paystack',
+          gatewayResponse: verification.gatewayResponse || 'Successful',
+          paidAt: order.paidAt,
+          metadata: verification.metadata,
+        });
 
-      // 8. Credit Vendor Ledger atomically
-      await creditVendorForTicketSale({
-        vendorId: organizerId,
-        eventId: primaryEvent._id,
-        orderId: order._id,
-        transactionId: transaction._id,
-        grossAmountNaira,
-        commissionRate,
-        reference,
-      });
+        // 8. Credit Vendor Ledger atomically
+        await creditVendorForTicketSale({
+          vendorId: organizerId,
+          eventId: primaryEvent._id,
+          orderId: order._id,
+          transactionId: transaction._id,
+          grossAmountNaira,
+          commissionRate,
+          reference,
+        });
+      } catch (insertErr) {
+        if (insertErr.code === 11000) {
+          // Concurrent insert by webhook
+          transaction = await PaymentTransaction.findOne({ reference });
+        } else {
+          throw insertErr;
+        }
+      }
     }
 
-    // 9. Issue Tickets with Cryptographic TICKZA-V1 QR Tokens
-    const buyer = await User.findById(order.userId);
-    const tickets = await issueTicketsForOrder(order, buyer, primaryEvent);
+    // 9. Issue Tickets with Cryptographic TICKZA-V1 QR Tokens (guarded against duplicates)
+    let tickets = await Ticket.find({ orderId: order._id });
+    if (!tickets || tickets.length === 0) {
+      const buyer = await User.findById(order.userId);
+      tickets = await issueTicketsForOrder(order, buyer, primaryEvent);
+    }
 
     // 10. Notifications & Audit Logging
     await Notification.create({
