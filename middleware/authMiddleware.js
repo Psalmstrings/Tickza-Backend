@@ -67,11 +67,16 @@ export const requireApproved = (req, res, next) => {
     return next();
   }
 
-  if (req.user.status !== 'APPROVED') {
+  // Must have approved status and organizer/approved role
+  const isApprovedOrganizer =
+    req.user.status === 'APPROVED' &&
+    ['APPROVED_USER', 'ORGANIZER'].includes(req.user.role);
+
+  if (!isApprovedOrganizer) {
     return res.status(403).json({
       success: false,
       code: 'ACCOUNT_APPROVAL_REQUIRED',
-      message: 'Your account is pending approval. You will be able to create events, create tickets, and transfer tickets once your account has been approved by an administrator.',
+      message: 'Your account is pending approval or lacks organizer privileges. You will be able to create events, create tickets, and access organizer management tools once your account has been approved by an administrator.',
     });
   }
 

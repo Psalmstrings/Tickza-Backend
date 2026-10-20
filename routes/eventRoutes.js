@@ -21,7 +21,7 @@ const router = express.Router();
 router.get('/', getEvents);
 
 // @route   GET  /api/events/organizer/my-events  — Private: organizer's own events
-router.get('/organizer/my-events', protect, getOrganizerEvents);
+router.get('/organizer/my-events', protect, requireApproved, getOrganizerEvents);
 
 // @route   POST /api/events/upload   — Private (Approved): upload event media
 router.post(
