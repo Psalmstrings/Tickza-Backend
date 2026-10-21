@@ -237,7 +237,16 @@ export const releaseVendorReservedBalance = async ({
   payoutId,
   reason = 'Payout rejected or cancelled',
 }) => {
-  const idempotencyKey = `RELEASE-${payoutId}-${Date.now()}`;
+  // Use a stable idempotency key so concurrent calls for the same payout cannot
+  // double-credit the vendor's available balance.
+  const reasonSlug = reason.replace(/\s+/g, '_').replace(/[^A-Za-z0-9_]/g, '').slice(0, 32);
+  const idempotencyKey = `RELEASE-${payoutId}-${reasonSlug}`;
+
+  // Guard: if already released for this payout+reason combination, return early
+  const existingLedger = await VendorLedger.findOne({ idempotencyKey });
+  if (existingLedger) {
+    return existingLedger;
+  }
 
   // Atomically move from reserved back to available
   const updatedVendor = await User.findOneAndUpdate(
@@ -256,7 +265,7 @@ export const releaseVendorReservedBalance = async ({
   );
 
   if (!updatedVendor) {
-    // Fallback: just return if reserved balance already adjusted
+    // Fallback: reserved balance already adjusted or insufficient — return null gracefully
     return null;
   }
 

@@ -626,11 +626,29 @@ export const approvePayout = async (req, res) => {
       });
     }
 
-    const recipientCode = payout.bankAccount?.recipientCode || payout.organizerId?.bankAccount?.recipientCode;
+    let recipientCode = payout.bankAccount?.recipientCode || payout.organizerId?.bankAccount?.recipientCode;
+    if (!recipientCode && payout.organizerId?.bankAccount?.accountNumber && payout.organizerId?.bankAccount?.bankCode) {
+      try {
+        const resRec = await paystackService.createTransferRecipient({
+          name: payout.bankAccount?.accountName || payout.organizerId.bankAccount.accountName || `${payout.organizerId.firstName} ${payout.organizerId.lastName}`,
+          accountNumber: payout.organizerId.bankAccount.accountNumber,
+          bankCode: payout.organizerId.bankAccount.bankCode,
+        });
+        if (resRec?.recipientCode) {
+          recipientCode = resRec.recipientCode;
+          payout.bankAccount.recipientCode = recipientCode;
+          payout.organizerId.bankAccount.recipientCode = recipientCode;
+          await payout.organizerId.save();
+        }
+      } catch (recErr) {
+        console.warn('[Auto Recipient in Approval]', recErr.message);
+      }
+    }
+
     if (!recipientCode) {
       return res.status(400).json({
         success: false,
-        message: 'No Paystack recipient code associated with this vendor bank account.',
+        message: 'No Paystack recipient code associated with this vendor bank account. Please verify bank details.',
       });
     }
 
@@ -648,14 +666,46 @@ export const approvePayout = async (req, res) => {
         reason: `Tickza Payout ${payout.reference}`,
       });
     } catch (paystackErr) {
-      console.warn('[Paystack Transfer Notice]', paystackErr.message);
-      // For sandbox or when account permissions are pending approval
-      transferRes = {
-        transferCode: `TRF_sim_${Date.now().toString(36)}`,
-        status: 'success',
-        reference: payout.reference,
-        amount: payout.amountKobo,
-      };
+      console.error('[Paystack Transfer Error]', paystackErr.message);
+
+      const isTestEnv =
+        process.env.PAYSTACK_MOCK_TRANSFERS === 'true' ||
+        !process.env.PAYSTACK_SECRET_KEY ||
+        process.env.PAYSTACK_SECRET_KEY.startsWith('sk_test_');
+
+      if (isTestEnv && (paystackErr.message.includes('not configured') || paystackErr.message.includes('Transfer') || paystackErr.message.includes('balance') || paystackErr.message.includes('recipient'))) {
+        transferRes = {
+          transferCode: `TRF_test_${Date.now().toString(36)}`,
+          status: 'success',
+          reference: payout.reference,
+          amount: payout.amountKobo,
+          isSimulatedTest: true,
+        };
+      } else {
+        // Real failure: mark failed and restore vendor balance
+        payout.status = 'FAILED';
+        payout.paystackFailures = {
+          message: paystackErr.message,
+          statusCode: paystackErr.statusCode,
+          details: paystackErr.paystackData,
+          failedAt: new Date(),
+        };
+        await payout.save();
+
+        await releaseVendorReservedBalance({
+          vendorId: payout.organizerId._id,
+          amountKobo: payout.amountKobo,
+          payoutId: payout._id,
+          reason: `Paystack transfer rejected: ${paystackErr.message}`,
+        });
+
+        return res.status(400).json({
+          success: false,
+          code: 'PAYSTACK_TRANSFER_FAILED',
+          message: `Paystack transfer could not be completed: ${paystackErr.message}. The vendor's reserved balance has been safely restored.`,
+          error: paystackErr.message,
+        });
+      }
     }
 
     payout.paystackTransferCode = transferRes.transferCode || '';
@@ -676,6 +726,8 @@ export const approvePayout = async (req, res) => {
         transferReference: payout.reference,
       });
     } else {
+      // Transfer is queued or pending settlement with Paystack
+      payout.status = 'PROCESSING';
       await payout.save();
     }
 

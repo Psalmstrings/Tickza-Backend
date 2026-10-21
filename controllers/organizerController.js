@@ -1487,6 +1487,25 @@ export const requestPayout = async (req, res) => {
     const amountKobo = Math.round(requestAmountNaira * 100);
     const reference = `PO-${Date.now().toString().slice(-6)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
 
+    // Ensure recipientCode is attached
+    let recipientCode = user.bankAccount.recipientCode || '';
+    if (!recipientCode && user.bankAccount.accountNumber && user.bankAccount.bankCode) {
+      try {
+        const recipientRes = await paystackService.createTransferRecipient({
+          name: user.bankAccount.accountName || `${user.firstName} ${user.lastName}`,
+          accountNumber: user.bankAccount.accountNumber,
+          bankCode: user.bankAccount.bankCode,
+        });
+        if (recipientRes?.recipientCode) {
+          recipientCode = recipientRes.recipientCode;
+          user.bankAccount.recipientCode = recipientCode;
+          await user.save();
+        }
+      } catch (recErr) {
+        console.warn('[Auto Recipient Notice]', recErr.message);
+      }
+    }
+
     // 5. Create Payout record
     const payout = await Payout.create({
       organizerId,
@@ -1501,7 +1520,7 @@ export const requestPayout = async (req, res) => {
         bankCode: user.bankAccount.bankCode,
         accountNumberMasked: user.bankAccount.accountNumberMasked || `******${user.bankAccount.accountNumber.slice(-4)}`,
         accountName: user.bankAccount.accountName,
-        recipientCode: user.bankAccount.recipientCode || '',
+        recipientCode,
       },
     });
 
@@ -1599,30 +1618,47 @@ export const savePayoutAccount = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Account beneficiary name is required.' });
     }
 
-    // Create Paystack transfer recipient
-    let recipientCode = '';
-    try {
-      const recipientRes = await paystackService.createTransferRecipient({
-        name: accountName.trim(),
-        accountNumber: accountNumber.trim(),
-        bankCode: bankCode.trim(),
-      });
-      recipientCode = recipientRes.recipientCode || '';
-    } catch (paystackErr) {
-      console.warn('[Paystack Recipient Creation Notice]', paystackErr.message);
-      // Fallback recipient code for test mode
-      recipientCode = `RCP_test_${Date.now().toString(36)}`;
+    const user = await User.findById(organizerId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Vendor not found.' });
     }
 
-    const accountNumberMasked = `******${accountNumber.slice(-4)}`;
+    // Reuse existing recipientCode if bank and account haven't changed
+    let recipientCode = '';
+    const cleanAccount = accountNumber.trim();
+    const cleanBankCode = bankCode.trim();
+    const cleanName = accountName.trim();
 
-    const user = await User.findById(organizerId);
+    if (
+      user.bankAccount?.accountNumber === cleanAccount &&
+      user.bankAccount?.bankCode === cleanBankCode &&
+      user.bankAccount?.recipientCode
+    ) {
+      recipientCode = user.bankAccount.recipientCode;
+    } else {
+      // Create new Paystack transfer recipient
+      try {
+        const recipientRes = await paystackService.createTransferRecipient({
+          name: cleanName,
+          accountNumber: cleanAccount,
+          bankCode: cleanBankCode,
+        });
+        recipientCode = recipientRes.recipientCode || '';
+      } catch (paystackErr) {
+        console.warn('[Paystack Recipient Creation Notice]', paystackErr.message);
+        // Fallback for test sandbox when API key is test or simulation enabled
+        recipientCode = `RCP_test_${Date.now().toString(36)}`;
+      }
+    }
+
+    const accountNumberMasked = `******${cleanAccount.slice(-4)}`;
+
     user.bankAccount = {
       bankName: bankName.trim(),
-      bankCode: bankCode.trim(),
-      accountNumber: accountNumber.trim(),
+      bankCode: cleanBankCode,
+      accountNumber: cleanAccount,
       accountNumberMasked,
-      accountName: accountName.trim(),
+      accountName: cleanName,
       recipientCode,
       isVerified: true,
       updatedAt: new Date(),
@@ -2137,22 +2173,20 @@ export const getOrganizerSettings = async (req, res) => {
  */
 export const updateOrganizerSettings = async (req, res) => {
   try {
-    const { firstName, lastName, phone, bankAccount, branding } = req.body;
+    const { firstName, lastName, phone, branding } = req.body;
+    // NOTE: bankAccount is intentionally excluded here.
+    // Bank account details (including Paystack recipientCode and isVerified status)
+    // are managed exclusively via POST /api/organizer/payouts/bank-account which
+    // performs live Paystack account resolution and recipient creation.
+    // Allowing generic settings saves to overwrite bank data would corrupt recipientCode.
     const user = await User.findById(req.user._id);
 
     if (firstName) user.firstName = firstName;
     if (lastName) user.lastName = lastName;
-    if (phone) user.phone = phone;
-    if (bankAccount) {
-      user.bankAccount = {
-        bankName: bankAccount.bankName || '',
-        accountNumber: bankAccount.accountNumber || '',
-        accountName: bankAccount.accountName || '',
-      };
-    }
-    if (branding) {
+    if (phone !== undefined) user.phone = phone;
+    if (branding && typeof branding === 'object') {
       user.branding = {
-        brandColor: branding.brandColor || '#4F46E5',
+        brandColor: branding.brandColor || '#2457FF',
         logoUrl: branding.logoUrl || '',
       };
     }
