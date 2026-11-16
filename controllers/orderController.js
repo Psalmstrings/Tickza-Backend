@@ -338,9 +338,10 @@ export const createOrder = async (req, res) => {
             seat: item.format === 'RESERVED_TABLE' ? `Table ${packageIndex} (Full Table)` : `Group Pass (${capacity} Persons)`,
             price: item.unitPrice,
             currency: 'NGN',
+            admissionType: isOrderFree ? 'FREE' : 'PAID',
             benefits: item.benefits || [],
             qrToken: parentQrToken,
-            status: 'SOLD',
+            status: isOrderFree ? 'REGISTERED' : 'SOLD',
             transferable: item.transferable,
             resellable: item.resellable,
             history: [
@@ -375,9 +376,10 @@ export const createOrder = async (req, res) => {
               seat: item.format === 'RESERVED_TABLE' ? `Table ${packageIndex} - Seat ${p}` : `Guest Pass #${p} of ${capacity}`,
               price: 0, // Individual seat value covered by parent package price
               currency: 'NGN',
+              admissionType: isOrderFree ? 'FREE' : 'PAID',
               benefits: item.benefits || [],
               qrToken: attendeeQrToken,
-              status: 'SOLD',
+              status: isOrderFree ? 'REGISTERED' : 'SOLD',
               transferable: item.transferable,
               resellable: false,
               history: [

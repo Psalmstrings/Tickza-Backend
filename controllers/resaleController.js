@@ -184,10 +184,30 @@ export const buyResaleTicket = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Associated ticket not found.' });
     }
 
+    // Concurrency guard: Atomically transition status from ACTIVE to SOLD
+    const updatedListing = await ResaleListing.findOneAndUpdate(
+      { _id: listing._id, status: 'ACTIVE' },
+      {
+        $set: {
+          status: 'SOLD',
+          buyerId: req.user._id,
+          soldAt: new Date(),
+        },
+      },
+      { new: true }
+    );
+
+    if (!updatedListing) {
+      return res.status(400).json({
+        success: false,
+        message: 'This resale listing was just purchased by another buyer or is no longer active.',
+      });
+    }
+
     const previousOwnerId = ticket.ownerId;
 
     // Regenerate QR token bound to new owner so old QR is invalidated
-    const tempId   = crypto.randomBytes(12).toString('hex');
+    const tempId = crypto.randomBytes(12).toString('hex');
     const newQrToken = generateSecureQRToken(tempId, ticket.eventId._id, req.user._id);
 
     // Transfer ticket ownership
@@ -203,11 +223,35 @@ export const buyResaleTicket = async (req, res) => {
     });
     await ticket.save();
 
-    // Finalise the listing
-    listing.status  = 'SOLD';
-    listing.buyerId = req.user._id;
-    listing.soldAt  = new Date();
-    await listing.save();
+    // Settle wallet balances and ledger if funds available
+    const { User } = await import('../models/User.js');
+    const buyer = await User.findById(req.user._id);
+    const seller = await User.findById(listing.sellerId._id);
+    const sellerNetKobo = Math.round((listing.sellerReceives || listing.price) * 100);
+
+    if (buyer && (buyer.balance || 0) >= listing.price) {
+      buyer.balance -= listing.price;
+      await buyer.save();
+
+      if (seller) {
+        seller.availableBalanceKobo = (seller.availableBalanceKobo || 0) + sellerNetKobo;
+        seller.balance = (seller.balance || 0) + (sellerNetKobo / 100);
+        await seller.save();
+
+        const { VendorLedger } = await import('../models/VendorLedger.js');
+        await VendorLedger.create({
+          vendorId: seller._id,
+          type: 'RESALE_PAYOUT',
+          amountKobo: sellerNetKobo,
+          currency: 'NGN',
+          direction: 'CREDIT',
+          classification: 'AVAILABLE',
+          balanceAfterKobo: seller.availableBalanceKobo,
+          idempotencyKey: `RESALE-${listing._id}-${Date.now()}`,
+          description: `Earnings from resale listing #${listing._id}`,
+        });
+      }
+    }
 
     const eventTitle = ticket.eventId?.title || listing.eventId?.title || 'your event';
 

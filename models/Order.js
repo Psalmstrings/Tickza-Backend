@@ -71,6 +71,14 @@ const orderSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    refundDetails: {
+      refundedAt: { type: Date, default: null },
+      reason: { type: String, default: '' },
+      paystackRefundId: { type: String, default: '' },
+      paystackRefundStatus: { type: String, default: '' },
+      amountRefundedKobo: { type: Number, default: 0 },
+      refundedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    },
     items: [
       {
         ticketTypeId: { type: mongoose.Schema.Types.ObjectId, ref: 'TicketType' },

@@ -24,7 +24,7 @@ import {
 // @access  Admin | Super Admin
 export const getUsers = async (req, res) => {
   try {
-    const { page = 1, limit = 20, search = '', status = '' } = req.query;
+    const { page = 1, limit = 50, search = '', status = '', organizerStatus = '' } = req.query;
     const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
 
     const query = { isDeleted: false };
@@ -33,19 +33,24 @@ export const getUsers = async (req, res) => {
       query.status = status;
     }
 
+    if (organizerStatus && ['NOT_REQUESTED', 'REQUESTED', 'APPROVED', 'REJECTED'].includes(organizerStatus)) {
+      query.organizerStatus = organizerStatus;
+    }
+
     if (search) {
       query.$or = [
         { firstName: { $regex: search, $options: 'i' } },
         { lastName:  { $regex: search, $options: 'i' } },
         { email:     { $regex: search, $options: 'i' } },
         { phone:     { $regex: search, $options: 'i' } },
+        { organizationName: { $regex: search, $options: 'i' } },
       ];
     }
 
     const [users, total] = await Promise.all([
       User.find(query)
         .select('-passwordHash')
-        .sort({ createdAt: -1 })
+        .sort({ organizerStatus: -1, createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit, 10)),
       User.countDocuments(query),
@@ -64,6 +69,74 @@ export const getUsers = async (req, res) => {
   }
 };
 
+// @desc    Get all pending organizer requests
+// @route   GET /api/admin/organizer-requests
+// @access  Admin | Super Admin
+export const getOrganizerRequests = async (req, res) => {
+  try {
+    const requests = await User.find({ organizerStatus: 'REQUESTED', isDeleted: false })
+      .select('-passwordHash')
+      .sort({ organizerRequestedAt: -1, updatedAt: -1 });
+
+    return res.json({
+      success: true,
+      count: requests.length,
+      data: requests,
+    });
+  } catch (error) {
+    console.error('[Admin getOrganizerRequests Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Reject an organizer request
+// @route   PATCH /api/admin/users/:id/reject-organizer
+// @access  Admin | Super Admin
+export const rejectOrganizerRequest = async (req, res) => {
+  try {
+    const { reason = 'Application details could not be verified at this time.' } = req.body;
+    const user = await User.findById(req.params.id);
+    if (!user || user.isDeleted) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    user.organizerStatus = 'REJECTED';
+    await user.save();
+
+    await Notification.create({
+      userId:  user._id,
+      title:   'Organizer Application Update',
+      message: `Your request to become an organizer could not be approved at this time. Reason: ${reason}. You may update your organization profile or contact support.`,
+      type:    'ACCOUNT_REJECTED',
+    });
+
+    emitToUser(user._id, 'notification', {
+      title:   'Organizer Application Update',
+      message: `Your request to become an organizer was reviewed.`,
+    });
+
+    await logAudit({
+      actorId:    req.user._id,
+      actorName:  `${req.user.firstName} ${req.user.lastName}`,
+      actorRole:  req.user.role,
+      action:     'ADMIN_REJECT_ORGANIZER_REQUEST',
+      targetType: 'USER',
+      targetId:   user._id,
+      details:    { email: user.email, reason },
+      req,
+    });
+
+    return res.json({
+      success: true,
+      message: `Organizer request for ${user.firstName} ${user.lastName} has been rejected.`,
+      data: { id: user._id, organizerStatus: user.organizerStatus },
+    });
+  } catch (error) {
+    console.error('[Admin rejectOrganizerRequest Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 // @desc    Approve a user account
 // @route   PATCH /api/admin/users/:id/approve
 // @access  Admin | Super Admin
@@ -74,25 +147,26 @@ export const approveUser = async (req, res) => {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    if (user.status === 'APPROVED') {
-      return res.status(400).json({ success: false, message: 'User is already approved.' });
+    if (user.role === 'ORGANIZER' || user.role === 'APPROVED_USER') {
+      return res.status(400).json({ success: false, message: 'User already has active organizer privileges.' });
     }
 
     user.status = 'APPROVED';
-    user.role   = 'APPROVED_USER';
+    user.role   = 'ORGANIZER';
+    user.organizerStatus = 'APPROVED';
     await user.save();
 
     // Create in-app notification for the user
     await Notification.create({
       userId:  user._id,
-      title:   'Account Approved ✅',
-      message: 'Congratulations! Your account has been approved by an administrator. You can now create events, purchase and transfer tickets.',
+      title:   'Organizer Privileges Approved 🎉',
+      message: 'Congratulations! Your request to become an event organizer on Tickza has been approved. You can now create events, sell tickets, and access your Organizer Command Center.',
       type:    'ACCOUNT_APPROVED',
     });
 
     emitToUser(user._id, 'notification', {
-      title:   'Account Approved',
-      message: 'Your Tickza account has been approved!',
+      title:   'Organizer Privileges Approved',
+      message: 'You are now an approved event organizer on Tickza!',
     });
 
     await logAudit({
@@ -476,6 +550,7 @@ export const getStats = async (req, res) => {
       pendingUsers,
       approvedUsers,
       suspendedUsers,
+      pendingOrganizerRequests,
       totalEvents,
       publishedEvents,
       totalTickets,
@@ -485,6 +560,7 @@ export const getStats = async (req, res) => {
       User.countDocuments({ status: 'PENDING',   isDeleted: false }),
       User.countDocuments({ status: 'APPROVED',  isDeleted: false }),
       User.countDocuments({ status: 'SUSPENDED', isDeleted: false }),
+      User.countDocuments({ organizerStatus: 'REQUESTED', isDeleted: false }),
       Event.countDocuments({}),
       Event.countDocuments({ status: 'PUBLISHED' }),
       Ticket.countDocuments({}),
@@ -498,6 +574,7 @@ export const getStats = async (req, res) => {
         pendingUsers,
         approvedUsers,
         suspendedUsers,
+        pendingOrganizerRequests,
         totalEvents,
         publishedEvents,
         totalTickets,
@@ -911,5 +988,152 @@ export const updateFinancialSettings = async (req, res) => {
   } catch (error) {
     console.error('[Admin updateFinancialSettings Error]', error);
     return res.status(400).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Admin refund order and restore inventory & vendor ledger
+// @route   POST /api/admin/orders/:id/refund
+// @access  Admin | Super Admin
+export const processAdminOrderRefund = async (req, res) => {
+  try {
+    const { reason = 'Refunded by administrator' } = req.body;
+    const order = await Order.findById(req.params.id).populate('items.eventId');
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    if (order.status === 'REFUNDED') {
+      return res.status(400).json({ success: false, message: 'This order has already been refunded.' });
+    }
+
+    // If paid order through Paystack, initiate actual gateway refund
+    let paystackRefund = null;
+    if (order.admissionType === 'PAID' && order.paymentReference) {
+      try {
+        paystackRefund = await paystackService.createRefund({
+          transactionReference: order.paymentReference,
+          amountInKobo: Math.round(order.totalAmount * 100),
+          merchantNote: `Admin refund for order #${order.orderNumber}: ${reason}`,
+          customerNote: `Refund for order #${order.orderNumber}: ${reason}`,
+        });
+      } catch (paystackErr) {
+        console.error('[Admin Paystack Refund Error]', paystackErr.message);
+        const errMsg = paystackErr.message || '';
+        if (!errMsg.toLowerCase().includes('already refunded')) {
+          return res.status(400).json({
+            success: false,
+            message: `Paystack refund initiation failed: ${errMsg}`,
+          });
+        }
+      }
+    }
+
+    order.status = 'REFUNDED';
+    order.refundDetails = {
+      refundedAt: new Date(),
+      reason,
+      paystackRefundId: paystackRefund?.id ? String(paystackRefund.id) : '',
+      paystackRefundStatus: paystackRefund?.status || 'completed',
+      amountRefundedKobo: Math.round(order.totalAmount * 100),
+      refundedBy: req.user._id,
+    };
+    await order.save();
+
+    // Mark tickets as REFUNDED
+    await Ticket.updateMany(
+      { orderId: order._id },
+      {
+        $set: { status: 'REFUNDED' },
+        $push: {
+          history: {
+            action: 'CANCELLED',
+            timestamp: new Date(),
+            notes: `Refunded by administrator: ${reason}`,
+          },
+        },
+      }
+    );
+
+    // Restore inventory
+    const { TicketType } = await import('../models/TicketType.js');
+    if (Array.isArray(order.items)) {
+      for (const item of order.items) {
+        if (item.ticketTypeId && item.quantity > 0) {
+          await TicketType.findByIdAndUpdate(item.ticketTypeId, {
+            $inc: { availableQuantity: item.quantity },
+          });
+        }
+      }
+    }
+
+    // Decrement free registered count if applicable
+    const firstItem = order.items?.[0];
+    const eventDoc = firstItem?.eventId;
+    if (order.admissionType === 'FREE' && eventDoc?._id) {
+      await Event.findByIdAndUpdate(eventDoc._id, { $inc: { registeredCount: -1 } });
+    }
+
+    // If paid order, reverse vendor earnings and record ledger entry
+    const organizerId = eventDoc?.organizerId;
+    if (order.admissionType === 'PAID' && order.vendorShare > 0 && organizerId) {
+      const vendorShareKobo = Math.round((order.vendorShare || 0) * 100);
+      const updatedVendor = await User.findByIdAndUpdate(
+        organizerId,
+        {
+          $inc: {
+            availableBalanceKobo: -vendorShareKobo,
+            balance: -(vendorShareKobo / 100),
+          },
+        },
+        { new: true }
+      );
+
+      await VendorLedger.create({
+        vendorId: organizerId,
+        orderId: order._id,
+        type: 'REFUND_DEDUCTION',
+        amountKobo: vendorShareKobo,
+        currency: 'NGN',
+        direction: 'DEBIT',
+        classification: 'AVAILABLE',
+        balanceAfterKobo: updatedVendor ? updatedVendor.availableBalanceKobo : 0,
+        idempotencyKey: `ADMIN-REFUND-${order._id}-${Date.now()}`,
+        description: `Admin deduction for refunded order #${order.orderNumber}: ${reason}`,
+      });
+    }
+
+    // Notify buyer
+    await Notification.create({
+      userId: order.userId,
+      title: 'Order Refunded by Admin',
+      message: `Your order #${order.orderNumber} has been refunded. Reason: ${reason}.`,
+      type: 'ORDER_UPDATE',
+      data: { orderId: order._id },
+    });
+
+    emitToUser(order.userId, 'notification', {
+      title: 'Order Refunded',
+      message: `Order #${order.orderNumber} refunded.`,
+    });
+
+    await logAudit({
+      actorId: req.user._id,
+      actorName: `${req.user.firstName} ${req.user.lastName}`,
+      actorRole: req.user.role,
+      action: 'ADMIN_REFUND_ORDER',
+      targetType: 'ORDER',
+      targetId: order._id,
+      details: { orderNumber: order.orderNumber, reason, amount: order.totalAmount },
+      req,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Order refunded successfully and inventory restored.',
+      data: order,
+    });
+  } catch (error) {
+    console.error('[Admin processAdminOrderRefund Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
   }
 };

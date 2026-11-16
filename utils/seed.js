@@ -1,9 +1,9 @@
 /**
  * utils/seed.js
  *
- * Seeder for the Super Admin account.
- * Run standalone:  node utils/seed.js
- * Called on start: imported and invoked from server.js
+ * Safe Super Admin initialization.
+ * Reads solely from environment variables (ADMIN_EMAIL, ADMIN_PASSWORD).
+ * Never hardcodes personal credentials or seed passwords into source control.
  */
 
 import 'dotenv/config';
@@ -11,50 +11,51 @@ import bcrypt from 'bcryptjs';
 import { User } from '../models/User.js';
 import { connectDB } from '../config/db.js';
 
-const ADMIN_EMAIL     = process.env.ADMIN_EMAIL || 'psalmstringsdigital@gmail.com';
-const ADMIN_PASSWORD  = process.env.ADMIN_PASSWORD || 'Admin@1234';
-const ADMIN_FIRST     = process.env.ADMIN_FIRST || 'Super';
-const ADMIN_LAST      = process.env.ADMIN_LAST || 'Admin';
-const ADMIN_PHONE     = process.env.ADMIN_PHONE || '+10000000000';
-
-/**
- * Seed events - disabled (no seed events or tickets).
- */
 export const seedEvents = async () => {
-  // Seed events removed per user configuration
+  // No default seed events per production readiness requirements
 };
 
 /**
- * Seed the Super Admin user.
- * Safe to call multiple times.
+ * Seed the Super Admin user only if ADMIN_EMAIL and ADMIN_PASSWORD are provided.
  */
 export const seedAdmin = async () => {
+  const adminEmail = process.env.ADMIN_EMAIL;
+  const adminPassword = process.env.ADMIN_PASSWORD;
+
+  if (!adminEmail || !adminPassword) {
+    // Gracefully skip seeding if no admin credentials are configured in .env
+    return;
+  }
+
+  const adminFirst = process.env.ADMIN_FIRST || 'Super';
+  const adminLast = process.env.ADMIN_LAST || 'Admin';
+  const adminPhone = process.env.ADMIN_PHONE || '+2340000000000';
+
   try {
-    let admin = await User.findOne({ email: ADMIN_EMAIL });
+    let admin = await User.findOne({ email: adminEmail.toLowerCase() });
 
     if (!admin) {
       const salt = await bcrypt.genSalt(10);
-      const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, salt);
+      const passwordHash = await bcrypt.hash(adminPassword, salt);
 
       admin = await User.create({
-        firstName: ADMIN_FIRST,
-        lastName: ADMIN_LAST,
-        email: ADMIN_EMAIL,
-        phone: ADMIN_PHONE,
+        firstName: adminFirst,
+        lastName: adminLast,
+        email: adminEmail.toLowerCase(),
+        phone: adminPhone,
         passwordHash,
         role: 'SUPER_ADMIN',
         status: 'APPROVED',
         emailVerified: true,
+        acceptedTerms: true,
+        acceptedTermsAt: new Date(),
         avatar: {
-          url: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(ADMIN_FIRST + ' ' + ADMIN_LAST)}`,
+          url: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(adminFirst + ' ' + adminLast)}`,
           publicId: '',
         },
       });
 
-      console.log(`\n✅ [Seed] Super Admin created:`);
-      console.log(`   Email:    ${ADMIN_EMAIL}`);
-      console.log(`   Role:     SUPER_ADMIN`);
-      console.log(`   ID:       ${admin._id}\n`);
+      console.log(`\n✅ [Seed] Configured Super Admin initialized from environment: ${adminEmail}\n`);
     } else {
       let updated = false;
       if (admin.role !== 'SUPER_ADMIN') {
@@ -65,23 +66,24 @@ export const seedAdmin = async () => {
         admin.status = 'APPROVED';
         updated = true;
       }
+      if (!admin.emailVerified) {
+        admin.emailVerified = true;
+        updated = true;
+      }
       if (updated) {
         await admin.save();
-        console.log('[Seed] Super Admin permissions updated to SUPER_ADMIN & APPROVED.');
-      } else {
-        console.log('[Seed] Super Admin already exists.');
+        console.log('[Seed] Super Admin permissions verified.');
       }
     }
   } catch (error) {
     if (error.code === 11000) {
-      console.log('[Seed] Admin already exists (duplicate key) — skipping.');
       return;
     }
     console.error('[Seed Error]', error.message);
   }
 };
 
-// ── Standalone execution ──────────────────────────────────────────────────────
+// Standalone execution
 const isMain = process.argv[1]?.endsWith('seed.js');
 if (isMain) {
   (async () => {

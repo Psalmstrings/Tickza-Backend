@@ -1,8 +1,10 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import { User } from '../models/User.js';
 import { Notification } from '../models/Notification.js';
 import { logAudit } from '../services/auditService.js';
+import { sendVerificationEmail, sendPasswordResetEmail } from '../services/emailService.js';
 
 const generateToken = (id) => {
   return jwt.sign({ id }, process.env.JWT_SECRET || 'tickapp_jwt_super_secret_key_2026_production', {
@@ -15,17 +17,30 @@ const generateToken = (id) => {
 // @access  Public
 export const register = async (req, res) => {
   try {
-    const { firstName, lastName, email, phone, password, confirmPassword } = req.body;
+    const { firstName, lastName, email, phone, password, confirmPassword, acceptedTerms } = req.body;
 
     if (!firstName || !lastName || !email || !phone || !password) {
       return res.status(400).json({ success: false, message: 'All fields are required.' });
+    }
+
+    // Strict validation for Terms & Conditions acceptance
+    if (acceptedTerms !== true && acceptedTerms !== 'true') {
+      return res.status(400).json({
+        success: false,
+        message: 'You must read and accept the Terms and Conditions to complete your registration.',
+      });
     }
 
     if (password !== confirmPassword) {
       return res.status(400).json({ success: false, message: 'Passwords do not match.' });
     }
 
-    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (password.length < 6) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters long.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const existingUser = await User.findOne({ email: cleanEmail });
     if (existingUser) {
       return res.status(400).json({ success: false, message: 'An account with this email already exists.' });
     }
@@ -33,35 +48,152 @@ export const register = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    // Initial status MUST be PENDING
+    // Generate 6-digit verification code with 24-hour expiration
+    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const verificationCodeExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    // Initial user account is active as an attendee, requiring only Gmail email verification
     const user = await User.create({
-      firstName,
-      lastName,
-      email: email.toLowerCase(),
-      phone,
+      firstName: firstName.trim(),
+      lastName: lastName.trim(),
+      email: cleanEmail,
+      phone: phone.trim(),
       passwordHash,
-      role: 'PENDING_USER',
-      status: 'PENDING',
+      role: 'USER',
+      status: 'APPROVED',
+      organizerStatus: 'NOT_REQUESTED',
       balance: 0,
+      emailVerified: false,
+      verificationCode,
+      verificationCodeExpires,
+      acceptedTerms: true,
+      acceptedTermsAt: new Date(),
       avatar: {
-        url: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(firstName + ' ' + lastName)}`,
+        url: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(firstName.trim() + ' ' + lastName.trim())}`,
         publicId: '',
       },
     });
 
+    // Send verification email via Gmail
+    try {
+      await sendVerificationEmail({
+        to: user.email,
+        name: user.firstName,
+        verificationCode,
+      });
+    } catch (mailError) {
+      console.error('[Register] Notice: Verification email sending encountered an error:', mailError.message);
+    }
+
     // Create welcoming notification
     await Notification.create({
       userId: user._id,
-      title: 'Welcome to Tickza!',
-      message: 'Your account has been created and is currently awaiting admin approval to create and transfer tickets.',
+      title: 'Welcome to Tickza! 🎉',
+      message: 'Your account is ready. Discover exciting live concerts, festivals, conferences, and entertainment passes.',
       type: 'ACCOUNT_CREATED',
     });
 
     await logAudit({
       actorId: user._id,
-      actorName: `${firstName} ${lastName}`,
-      actorRole: 'PENDING_USER',
+      actorName: `${user.firstName} ${user.lastName}`,
+      actorRole: 'USER',
       action: 'USER_REGISTERED',
+      targetType: 'USER',
+      targetId: user._id,
+      req,
+    });
+
+    return res.status(201).json({
+      success: true,
+      requiresVerification: true,
+      message: 'Account created! Please enter the 6-digit verification code sent to your Gmail.',
+      email: user.email,
+      user: {
+        id: user._id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        phone: user.phone,
+        role: user.role,
+        status: user.status,
+        organizerStatus: user.organizerStatus,
+        emailVerified: false,
+        acceptedTerms: user.acceptedTerms,
+      },
+    });
+  } catch (error) {
+    console.error('[Register Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Verify email with 6-digit OTP code or link
+// @route   POST /api/auth/verify-email
+// @access  Public
+export const verifyEmail = async (req, res) => {
+  try {
+    const { email, code } = req.body;
+
+    if (!email || !code) {
+      return res.status(400).json({ success: false, message: 'Email and verification code are required.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanCode = code.toString().trim();
+
+    const user = await User.findOne({ email: cleanEmail });
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Account not found with this email.' });
+    }
+
+    if (user.emailVerified) {
+      const token = generateToken(user._id);
+      return res.json({
+        success: true,
+        message: 'Your email is already verified.',
+        token,
+        user: {
+          id: user._id,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          email: user.email,
+          phone: user.phone,
+          role: user.role,
+          status: user.status,
+          organizerStatus: user.organizerStatus || 'NOT_REQUESTED',
+          organizationName: user.organizationName || '',
+          avatar: user.avatar,
+          balance: user.balance,
+          emailVerified: true,
+        },
+      });
+    }
+
+    if (!user.verificationCode || user.verificationCode !== cleanCode) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid verification code. Please check your email and enter the correct 6-digit code.',
+      });
+    }
+
+    if (user.verificationCodeExpires && user.verificationCodeExpires < new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Verification code has expired. Please request a new code.',
+      });
+    }
+
+    // Successfully verified
+    user.emailVerified = true;
+    user.verificationCode = null;
+    user.verificationCodeExpires = null;
+    await user.save();
+
+    await logAudit({
+      actorId: user._id,
+      actorName: `${user.firstName} ${user.lastName}`,
+      actorRole: user.role,
+      action: 'EMAIL_VERIFIED',
       targetType: 'USER',
       targetId: user._id,
       req,
@@ -69,9 +201,9 @@ export const register = async (req, res) => {
 
     const token = generateToken(user._id);
 
-    return res.status(201).json({
+    return res.json({
       success: true,
-      message: 'Account created successfully. Your account is awaiting admin approval.',
+      message: 'Email verified successfully! Welcome to Tickza.',
       token,
       user: {
         id: user._id,
@@ -81,12 +213,57 @@ export const register = async (req, res) => {
         phone: user.phone,
         role: user.role,
         status: user.status,
+        organizerStatus: user.organizerStatus || 'NOT_REQUESTED',
+        organizationName: user.organizationName || '',
         avatar: user.avatar,
         balance: user.balance,
+        emailVerified: true,
       },
     });
   } catch (error) {
-    console.error('[Register Error]', error);
+    console.error('[Verify Email Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Resend email verification code
+// @route   POST /api/auth/resend-verification
+// @access  Public
+export const resendVerification = async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email address is required.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const user = await User.findOne({ email: cleanEmail });
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Account not found with this email.' });
+    }
+
+    if (user.emailVerified) {
+      return res.json({ success: true, message: 'Your email address is already verified.' });
+    }
+
+    // Generate new code
+    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+    user.verificationCode = verificationCode;
+    user.verificationCodeExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await user.save();
+
+    await sendVerificationEmail({
+      to: user.email,
+      name: user.firstName,
+      verificationCode,
+    });
+
+    return res.json({
+      success: true,
+      message: 'A new 6-digit verification code has been sent to your email.',
+    });
+  } catch (error) {
+    console.error('[Resend Verification Error]', error);
     return res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -121,6 +298,28 @@ export const login = async (req, res) => {
       });
     }
 
+    // Check if email is verified
+    if (!user.emailVerified) {
+      // Regenerate verification code if expired or missing
+      if (!user.verificationCode || (user.verificationCodeExpires && user.verificationCodeExpires < new Date())) {
+        user.verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+        user.verificationCodeExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        await user.save();
+        sendVerificationEmail({
+          to: user.email,
+          name: user.firstName,
+          verificationCode: user.verificationCode,
+        }).catch((e) => console.error('[Login Verification Email]', e.message));
+      }
+
+      return res.status(403).json({
+        success: false,
+        code: 'EMAIL_NOT_VERIFIED',
+        message: 'Please verify your email address to access your account.',
+        email: user.email,
+      });
+    }
+
     const token = generateToken(user._id);
 
     return res.json({
@@ -135,8 +334,11 @@ export const login = async (req, res) => {
         phone: user.phone,
         role: user.role,
         status: user.status,
+        organizerStatus: user.organizerStatus || 'NOT_REQUESTED',
+        organizationName: user.organizationName || '',
         avatar: user.avatar,
         balance: user.balance,
+        emailVerified: user.emailVerified,
       },
     });
   } catch (error) {
@@ -164,8 +366,12 @@ export const getMe = async (req, res) => {
         phone: user.phone,
         role: user.role,
         status: user.status,
+        organizerStatus: user.organizerStatus || 'NOT_REQUESTED',
+        organizationName: user.organizationName || '',
         avatar: user.avatar,
         balance: user.balance,
+        emailVerified: user.emailVerified,
+        acceptedTerms: user.acceptedTerms,
       },
     });
   } catch (error) {
@@ -207,6 +413,7 @@ export const updateMe = async (req, res) => {
         status: user.status,
         avatar: user.avatar,
         balance: user.balance,
+        emailVerified: user.emailVerified,
       },
     });
   } catch (error) {
@@ -221,24 +428,42 @@ export const forgotPassword = async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) {
-      return res.status(400).json({ success: false, message: 'Email is required' });
+      return res.status(400).json({ success: false, message: 'Email address is required.' });
     }
-    const user = await User.findOne({ email: email.toLowerCase() });
+
+    const cleanEmail = email.trim().toLowerCase();
+    const user = await User.findOne({ email: cleanEmail, isDeleted: false });
     if (!user) {
-      // Return success to avoid email enumeration
+      // Return generic success to prevent email enumeration
       return res.json({
         success: true,
         message: 'If an account with that email exists, password reset instructions have been sent.',
       });
     }
-    // Set reset token or code
-    const resetToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'tickapp_jwt_super_secret_key_2026_production', { expiresIn: '1h' });
+
+    // Generate secure random reset token
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    user.resetPasswordToken = resetToken;
+    user.resetPasswordExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    await user.save();
+
+    try {
+      await sendPasswordResetEmail({
+        to: user.email,
+        name: user.firstName,
+        resetToken,
+      });
+    } catch (mailError) {
+      console.error('[Forgot Password] Mail Error:', mailError.message);
+    }
+
     return res.json({
       success: true,
       message: 'Password reset link sent successfully. Please check your inbox.',
-      resetToken, // for testing / development
+      resetToken: process.env.NODE_ENV === 'development' ? resetToken : undefined,
     });
   } catch (error) {
+    console.error('[Forgot Password Error]', error);
     return res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -249,23 +474,65 @@ export const forgotPassword = async (req, res) => {
 export const resetPassword = async (req, res) => {
   try {
     const { token, newPassword, confirmPassword } = req.body;
+
     if (!token || !newPassword) {
-      return res.status(400).json({ success: false, message: 'Reset token and new password are required' });
+      return res.status(400).json({ success: false, message: 'Reset token and new password are required.' });
     }
+
     if (newPassword !== confirmPassword) {
-      return res.status(400).json({ success: false, message: 'Passwords do not match' });
+      return res.status(400).json({ success: false, message: 'Passwords do not match.' });
     }
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'tickapp_jwt_super_secret_key_2026_production');
-    const user = await User.findById(decoded.id);
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters long.' });
+    }
+
+    // Find user with matching token and valid expiry
+    let user = await User.findOne({
+      resetPasswordToken: token,
+      resetPasswordExpires: { $gt: new Date() },
+    });
+
+    // Fallback: check if token was JWT signed token
     if (!user) {
-      return res.status(404).json({ success: false, message: 'Invalid or expired token' });
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'tickapp_jwt_super_secret_key_2026_production');
+        user = await User.findById(decoded.id);
+      } catch (jwtErr) {
+        // Not a valid JWT either
+      }
     }
+
+    if (!user) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired password reset link. Please request a new password reset.',
+      });
+    }
+
     const salt = await bcrypt.genSalt(10);
     user.passwordHash = await bcrypt.hash(newPassword, salt);
+    user.resetPasswordToken = null;
+    user.resetPasswordExpires = null;
     await user.save();
-    return res.json({ success: true, message: 'Password has been reset successfully. You can now log in.' });
+
+    await logAudit({
+      actorId: user._id,
+      actorName: `${user.firstName} ${user.lastName}`,
+      actorRole: user.role,
+      action: 'PASSWORD_RESET',
+      targetType: 'USER',
+      targetId: user._id,
+      req,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Password has been reset successfully. You can now log in with your new password.',
+    });
   } catch (error) {
-    return res.status(400).json({ success: false, message: 'Invalid or expired reset token.' });
+    console.error('[Reset Password Error]', error);
+    return res.status(400).json({ success: false, message: 'Failed to reset password. Please try again.' });
   }
 };
 
@@ -318,6 +585,7 @@ export const topUpBalance = async (req, res) => {
         status: user.status,
         avatar: user.avatar,
         balance: user.balance,
+        emailVerified: user.emailVerified,
       },
     });
   } catch (error) {

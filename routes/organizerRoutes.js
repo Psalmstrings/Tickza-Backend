@@ -37,11 +37,15 @@ import {
   processOrderRefund,
   getOrganizerSettings,
   updateOrganizerSettings,
+  requestOrganizerAccess,
 } from '../controllers/organizerController.js';
 
 const router = express.Router();
 
-// All organizer routes require authentication + account approval
+// ── Open Organizer Application (available to any logged in user) ──────────
+router.post('/request-access', protect, requestOrganizerAccess);
+
+// ── Protected Organizer Management Routes (require approved organizer privileges)
 router.use(protect, requireApproved);
 
 // ── Overview & Analytics ──────────────────────────────────────────────────────

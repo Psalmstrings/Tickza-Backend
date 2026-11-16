@@ -2076,6 +2076,10 @@ export const processOrderRefund = async (req, res) => {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
 
+    if (order.status === 'REFUNDED') {
+      return res.status(400).json({ success: false, message: 'This order has already been refunded.' });
+    }
+
     // Validate organizer ownership
     const firstItem = order.items?.[0];
     if (firstItem?.eventId) {
@@ -2083,7 +2087,37 @@ export const processOrderRefund = async (req, res) => {
       if (error) return res.status(status).json({ success: false, message: error });
     }
 
+    // If paid order through Paystack, initiate actual gateway refund
+    let paystackRefund = null;
+    if (order.admissionType === 'PAID' && order.paymentReference) {
+      try {
+        paystackRefund = await paystackService.createRefund({
+          transactionReference: order.paymentReference,
+          amountInKobo: Math.round(order.totalAmount * 100),
+          merchantNote: `Organizer refund for order #${order.orderNumber}`,
+          customerNote: `Refund for order #${order.orderNumber} initiated by organizer`,
+        });
+      } catch (paystackErr) {
+        console.error('[Organizer Paystack Refund Error]', paystackErr.message);
+        const errMsg = paystackErr.message || '';
+        if (!errMsg.toLowerCase().includes('already refunded')) {
+          return res.status(400).json({
+            success: false,
+            message: `Paystack refund initiation failed: ${errMsg}`,
+          });
+        }
+      }
+    }
+
     order.status = 'REFUNDED';
+    order.refundDetails = {
+      refundedAt: new Date(),
+      reason: 'Refunded by event organizer',
+      paystackRefundId: paystackRefund?.id ? String(paystackRefund.id) : '',
+      paystackRefundStatus: paystackRefund?.status || 'completed',
+      amountRefundedKobo: Math.round(order.totalAmount * 100),
+      refundedBy: req.user._id,
+    };
     await order.save();
 
     // Mark tickets as REFUNDED
@@ -2100,6 +2134,24 @@ export const processOrderRefund = async (req, res) => {
         },
       }
     );
+
+    // Concurrency-safe restoration of ticket inventory
+    if (Array.isArray(order.items)) {
+      for (const item of order.items) {
+        if (item.ticketTypeId && item.quantity > 0) {
+          await TicketType.findByIdAndUpdate(item.ticketTypeId, {
+            $inc: { availableQuantity: item.quantity },
+          });
+        }
+      }
+    }
+
+    // Decrement free registration count if applicable
+    if (order.admissionType === 'FREE' && firstItem?.eventId) {
+      await Event.findByIdAndUpdate(firstItem.eventId, {
+        $inc: { registeredCount: -1 },
+      });
+    }
 
     // If paid order, reverse vendor earnings and record ledger entry
     if (order.admissionType === 'PAID' && order.vendorShare > 0) {
@@ -2194,6 +2246,80 @@ export const updateOrganizerSettings = async (req, res) => {
     await user.save();
     return res.json({ success: true, message: 'Settings saved successfully', data: user });
   } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * @desc    User requests organizer approval to create events
+ * @route   POST /api/organizer/request-access
+ * @access  Private (Authenticated users)
+ */
+export const requestOrganizerAccess = async (req, res) => {
+  try {
+    const { organizationName, bio, phone } = req.body;
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    if (user.role === 'ORGANIZER' || user.role === 'APPROVED_USER') {
+      return res.json({
+        success: true,
+        message: 'You already have organizer privileges.',
+        user: {
+          id: user._id,
+          role: user.role,
+          status: user.status,
+          organizerStatus: 'APPROVED',
+        },
+      });
+    }
+
+    user.organizerStatus = 'REQUESTED';
+    user.organizerRequestedAt = new Date();
+    if (organizationName) user.organizationName = organizationName.trim();
+    if (bio) user.organizerBio = bio.trim();
+    if (phone && !user.phone) user.phone = phone.trim();
+
+    await user.save();
+
+    await Notification.create({
+      userId: user._id,
+      title: 'Organizer Request Received 📋',
+      message: 'Your application to become an event organizer has been submitted to the admin team for approval.',
+      type: 'ACCOUNT_CREATED',
+    });
+
+    await logAudit({
+      actorId: user._id,
+      actorName: `${user.firstName} ${user.lastName}`,
+      actorRole: user.role,
+      action: 'ORGANIZER_REQUESTED',
+      targetType: 'USER',
+      targetId: user._id,
+      details: { organizationName: user.organizationName },
+      req,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Organizer request submitted successfully! An administrator will review your application.',
+      user: {
+        id: user._id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        phone: user.phone,
+        role: user.role,
+        status: user.status,
+        organizerStatus: user.organizerStatus,
+        organizerRequestedAt: user.organizerRequestedAt,
+        organizationName: user.organizationName,
+      },
+    });
+  } catch (error) {
+    console.error('[Request Organizer Error]', error);
     return res.status(500).json({ success: false, message: error.message });
   }
 };

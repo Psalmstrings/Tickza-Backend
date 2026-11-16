@@ -126,24 +126,62 @@ export const scanQR = async (req, res) => {
       });
     }
 
-    // ── Step 6: Perform check-in (supporting group & table admissions) ────────
+    // ── Step 6: Atomic check-in operation (protects against concurrent scans) ────────
     const isMultiCapacity = admittedCapacity > 1;
     const countToAdmit = req.body.admitCount ? Math.min(parseInt(req.body.admitCount, 10), admittedCapacity - currentCheckedIn) : (isMultiCapacity ? admittedCapacity : 1);
 
-    const newCheckedInCount = currentCheckedIn + countToAdmit;
-    const isFullyCheckedIn = newCheckedInCount >= admittedCapacity;
+    const checkInTimestamp = new Date();
 
-    ticket.checkedInAt = ticket.checkedInAt || new Date();
-    ticket.checkedInBy = req.user._id;
-    ticket.attendeesCheckedIn = newCheckedInCount;
-    ticket.status = isFullyCheckedIn ? 'USED' : 'PARTIALLY_USED';
-    ticket.history.push({
-      action:    'CHECKED_IN',
-      toUser:    ticket.ownerId._id,
-      timestamp: new Date(),
-      notes:     `Checked in ${countToAdmit} guest(s) (${newCheckedInCount}/${admittedCapacity}) by ${req.user.firstName} ${req.user.lastName} at "${event.title}"`,
-    });
-    await ticket.save();
+    // Atomic update with optimistic lock: guarantees two concurrent scanners cannot admit the same ticket
+    const updatedTicket = await Ticket.findOneAndUpdate(
+      {
+        _id: ticket._id,
+        status: { $in: ['SOLD', 'REGISTERED', 'PARTIALLY_USED'] },
+        attendeesCheckedIn: { $lt: admittedCapacity },
+      },
+      {
+        $inc: { attendeesCheckedIn: countToAdmit },
+        $set: {
+          checkedInBy: req.user._id,
+          ...(ticket.checkedInAt ? {} : { checkedInAt: checkInTimestamp }),
+        },
+        $push: {
+          history: {
+            action: 'CHECKED_IN',
+            toUser: ticket.ownerId._id,
+            timestamp: checkInTimestamp,
+            notes: `Checked in ${countToAdmit} guest(s) by ${req.user.firstName} ${req.user.lastName} at "${event.title}"`,
+          },
+        },
+      },
+      { new: true }
+    );
+
+    if (!updatedTicket) {
+      await CheckIn.create({
+        ticketId: ticket._id,
+        eventId: event._id,
+        staffId: req.user._id,
+        checkInTime: new Date(),
+        status: 'DUPLICATE',
+        notes: `Simultaneous duplicate scan blocked atomically.`,
+      });
+
+      return res.status(409).json({
+        success: false,
+        code: 'ALREADY_CHECKED_IN',
+        message: 'This ticket was just checked in by another scanner or is already at full capacity.',
+      });
+    }
+
+    const newCheckedInCount = updatedTicket.attendeesCheckedIn;
+    const isFullyCheckedIn = newCheckedInCount >= admittedCapacity;
+    const targetStatus = isFullyCheckedIn ? 'USED' : 'PARTIALLY_USED';
+
+    if (updatedTicket.status !== targetStatus) {
+      updatedTicket.status = targetStatus;
+      await updatedTicket.save();
+    }
 
     // Create CheckIn record
     const checkInRecord = await CheckIn.create({
@@ -176,7 +214,7 @@ export const scanQR = async (req, res) => {
       owner:              `${ticket.ownerId.firstName} ${ticket.ownerId.lastName}`,
       admittedCapacity,
       attendeesCheckedIn: newCheckedInCount,
-      checkedInAt:        ticket.checkedInAt,
+      checkedInAt:        updatedTicket.checkedInAt || checkInTimestamp,
     });
 
     await logAudit({
@@ -211,7 +249,7 @@ export const scanQR = async (req, res) => {
           seat:               ticket.seat,
           tableNumber:        ticket.tableNumber,
           status:             ticket.status,
-          checkedInAt:        ticket.checkedInAt,
+          checkedInAt:        updatedTicket.checkedInAt || checkInTimestamp,
           owner: {
             firstName: ticket.ownerId.firstName,
             lastName:  ticket.ownerId.lastName,

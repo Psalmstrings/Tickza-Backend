@@ -359,9 +359,9 @@ export const verifyPayment = async (req, res) => {
     }
 
     // 9. Issue Tickets with Cryptographic TICKZA-V1 QR Tokens (guarded against duplicates)
+    const buyer = await User.findById(order.userId);
     let tickets = await Ticket.find({ orderId: order._id });
     if (!tickets || tickets.length === 0) {
-      const buyer = await User.findById(order.userId);
       tickets = await issueTicketsForOrder(order, buyer, primaryEvent);
     }
 
@@ -381,8 +381,8 @@ export const verifyPayment = async (req, res) => {
 
     await logAudit({
       actorId: order.userId,
-      actorName: `${buyer.firstName} ${buyer.lastName}`,
-      actorRole: buyer.role,
+      actorName: buyer ? `${buyer.firstName} ${buyer.lastName}` : 'Customer',
+      actorRole: buyer?.role || 'USER',
       action: 'PAYMENT_VERIFIED',
       targetType: 'ORDER',
       targetId: order._id,
@@ -565,6 +565,55 @@ export const handlePaystackWebhook = async (req, res) => {
           type: 'PAYOUT_PROCESSED',
           data: { payoutId: payout._id },
         });
+      }
+    }
+
+    // 4. Paystack Refund Processed (customer was refunded via Paystack gateway)
+    if (event === 'refund.processed') {
+      const transactionRef = data.transaction_reference;
+      const order = await Order.findOne({
+        $or: [{ paymentReference: transactionRef }, { orderNumber: transactionRef }],
+      });
+
+      if (order && order.status !== 'REFUNDED') {
+        order.status = 'REFUNDED';
+        order.refundDetails = {
+          refundedAt: new Date(),
+          reason: data.customer_note || 'Refund processed via Paystack gateway',
+          paystackRefundId: String(data.id || ''),
+          paystackRefundStatus: 'processed',
+          amountRefundedKobo: data.amount || Math.round(order.totalAmount * 100),
+        };
+        await order.save();
+
+        await Ticket.updateMany(
+          { orderId: order._id },
+          {
+            $set: { status: 'REFUNDED' },
+            $push: {
+              history: {
+                action: 'CANCELLED',
+                timestamp: new Date(),
+                notes: 'Ticket cancelled due to Paystack refund confirmation.',
+              },
+            },
+          }
+        );
+
+        console.log(`[Paystack Webhook] Order #${order.orderNumber} successfully updated to REFUNDED.`);
+      }
+    }
+
+    // 5. Paystack Refund Failed
+    if (event === 'refund.failed') {
+      const transactionRef = data.transaction_reference;
+      console.warn(`[Paystack Webhook] Refund failed for transaction ref ${transactionRef}`, data);
+      const order = await Order.findOne({
+        $or: [{ paymentReference: transactionRef }, { orderNumber: transactionRef }],
+      });
+      if (order && order.refundDetails) {
+        order.refundDetails.paystackRefundStatus = 'failed';
+        await order.save();
       }
     }
   } catch (error) {

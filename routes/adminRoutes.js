@@ -1,7 +1,9 @@
 import express from 'express';
 import {
   getUsers,
+  getOrganizerRequests,
   approveUser,
+  rejectOrganizerRequest,
   suspendUser,
   deleteUser,
   getAdminEvents,
@@ -9,6 +11,7 @@ import {
   rejectEvent,
   getAdminTickets,
   getAdminOrders,
+  processAdminOrderRefund,
   getAuditLogs,
   getStats,
   getAdminFinancials,
@@ -35,8 +38,14 @@ router.get('/stats', getStats);
 // @route  GET    /api/admin/users
 router.get('/users', getUsers);
 
+// @route  GET    /api/admin/organizer-requests
+router.get('/organizer-requests', getOrganizerRequests);
+
 // @route  PATCH  /api/admin/users/:id/approve
 router.patch('/users/:id/approve', approveUser);
+
+// @route  PATCH  /api/admin/users/:id/reject-organizer
+router.patch('/users/:id/reject-organizer', rejectOrganizerRequest);
 
 // @route  PATCH  /api/admin/users/:id/suspend
 router.patch('/users/:id/suspend', suspendUser);
@@ -61,6 +70,9 @@ router.get('/tickets', getAdminTickets);
 // ── Orders ─────────────────────────────────────────────────────────────────
 // @route  GET /api/admin/orders
 router.get('/orders', getAdminOrders);
+
+// @route  POST /api/admin/orders/:id/refund
+router.post('/orders/:id/refund', processAdminOrderRefund);
 
 // ── Audit Logs ─────────────────────────────────────────────────────────────
 // @route  GET /api/admin/audit-logs

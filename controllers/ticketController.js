@@ -141,12 +141,12 @@ export const createTicket = async (req, res) => {
   }
 };
 
-// @desc    Auto-search Ticketmaster / external events for 1-click import
+// @desc    Search published events for ticket template import
 // @route   GET /api/tickets/ticketmaster/search
 // @access  Private (Approved user only)
 export const searchTicketmaster = async (req, res) => {
   try {
-    if (req.user.status !== 'APPROVED' && req.user.role !== 'ADMIN') {
+    if (req.user.status !== 'APPROVED' && req.user.role !== 'ADMIN' && req.user.role !== 'SUPER_ADMIN') {
       return res.status(403).json({
         success: false,
         code: 'ACCOUNT_APPROVAL_REQUIRED',
@@ -155,86 +155,34 @@ export const searchTicketmaster = async (req, res) => {
     }
 
     const { query = '' } = req.query;
+    const filter = { status: 'PUBLISHED' };
+    if (query && typeof query === 'string' && query.trim()) {
+      filter.$or = [
+        { title: { $regex: query.trim(), $options: 'i' } },
+        { venue: { $regex: query.trim(), $options: 'i' } },
+        { category: { $regex: query.trim(), $options: 'i' } },
+      ];
+    }
 
-    // High quality curated mock dataset mirroring Ticketmaster events
-    const sampleEvents = [
-      {
-        id: 'tm-1',
-        title: 'Coldplay - Music of the Spheres World Tour',
-        venue: 'Wembley Stadium, London',
-        date: '2026-10-15',
-        time: '19:30',
-        category: 'Music',
-        description: 'Experience Coldplay live in concert featuring their greatest hits and stunning visual performances.',
-        coverImage: 'https://images.unsplash.com/photo-1540039155733-5bb30b53aa14?w=1000&auto=format&fit=crop&q=80',
-        latitude: 51.556,
-        longitude: -0.2795,
-        ticketTypes: [
-          { name: 'General Pitch Standing', price: 0, quantity: 500, section: 'Pitch Standing' },
-          { name: 'Level 1 Reserved Seating', price: 0, quantity: 300, section: 'Sec 104' },
-          { name: 'VIP Infinity Lounge', price: 0, quantity: 50, section: 'VIP Lounge' },
-        ],
-      },
-      {
-        id: 'tm-2',
-        title: 'Burna Boy Live: No Sign of Weakness Tour',
-        venue: 'Tafawa Balewa Square (TBS), Lagos',
-        date: '2026-11-20',
-        time: '20:00',
-        category: 'Music',
-        description: 'African Giant Burna Boy returns to Lagos with an electric full live band experience.',
-        coverImage: 'https://images.unsplash.com/photo-1501386761578-eac5c94b800a?w=1000&auto=format&fit=crop&q=80',
-        latitude: 6.4474,
-        longitude: 3.4024,
-        ticketTypes: [
-          { name: 'Regular Entry', price: 0, quantity: 1000, section: 'General' },
-          { name: 'VIP Front Row', price: 0, quantity: 200, section: 'VIP' },
-          { name: 'VVIP Table of 10', price: 0, quantity: 20, section: 'VVIP Table' },
-        ],
-      },
-      {
-        id: 'tm-3',
-        title: 'FIFA World Cup 2026 Celebration Match',
-        venue: 'MetLife Stadium, East Rutherford',
-        date: '2026-06-18',
-        time: '18:00',
-        category: 'Sports',
-        description: 'Special exhibition and international tournament game celebrating the World Cup 2026.',
-        coverImage: 'https://images.unsplash.com/photo-1508098682722-e99c43a406b2?w=1000&auto=format&fit=crop&q=80',
-        latitude: 40.8128,
-        longitude: -74.0742,
-        ticketTypes: [
-          { name: 'Category 1 Seating', price: 0, quantity: 400, section: 'Lower Tier' },
-          { name: 'Category 2 Seating', price: 0, quantity: 600, section: 'Upper Tier' },
-        ],
-      },
-      {
-        id: 'tm-4',
-        title: 'Afro Nation Music Festival 2026',
-        venue: 'Eko Atlantic City, Victoria Island',
-        date: '2026-12-28',
-        time: '16:00',
-        category: 'Festival',
-        description: 'The worlds biggest celebration of Afrobeats, Amapiano, dancehall, and global black culture.',
-        coverImage: 'https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=1000&auto=format&fit=crop&q=80',
-        latitude: 6.4167,
-        longitude: 3.4095,
-        ticketTypes: [
-          { name: 'General 3-Day Pass', price: 0, quantity: 1500, section: 'Beach Arena' },
-          { name: 'VIP Golden Circle', price: 0, quantity: 300, section: 'Golden Circle' },
-        ],
-      },
-    ];
+    const realEvents = await Event.find(filter)
+      .select('title venue startDate startTime category coverImage')
+      .limit(20);
 
-    const filtered = query
-      ? sampleEvents.filter(
-          (e) =>
-            e.title.toLowerCase().includes(query.toLowerCase()) ||
-            e.venue.toLowerCase().includes(query.toLowerCase())
-        )
-      : sampleEvents;
+    const eventIds = realEvents.map(e => e._id);
+    const tiers = await TicketType.find({ eventId: { $in: eventIds } });
 
-    return res.json({ success: true, count: filtered.length, data: filtered });
+    const results = realEvents.map(ev => ({
+      id: ev._id.toString(),
+      title: ev.title,
+      venue: ev.venue,
+      date: ev.startDate ? new Date(ev.startDate).toISOString().slice(0, 10) : '',
+      time: ev.startTime || '',
+      category: ev.category,
+      coverImage: ev.coverImage?.url || '',
+      ticketTypes: tiers.filter(t => t.eventId.toString() === ev._id.toString()),
+    }));
+
+    return res.json({ success: true, count: results.length, data: results });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }

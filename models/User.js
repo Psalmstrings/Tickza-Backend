@@ -34,13 +34,31 @@ const userSchema = new mongoose.Schema(
     role: {
       type: String,
       enum: ['USER', 'APPROVED_USER', 'PENDING_USER', 'ADMIN', 'SUPER_ADMIN', 'ORGANIZER'],
-      default: 'PENDING_USER',
+      default: 'USER',
     },
     status: {
       type: String,
       enum: ['PENDING', 'APPROVED', 'SUSPENDED', 'DELETED'],
-      default: 'PENDING',
+      default: 'APPROVED',
       index: true,
+    },
+    organizerStatus: {
+      type: String,
+      enum: ['NOT_REQUESTED', 'REQUESTED', 'APPROVED', 'REJECTED'],
+      default: 'NOT_REQUESTED',
+      index: true,
+    },
+    organizerRequestedAt: {
+      type: Date,
+      default: null,
+    },
+    organizationName: {
+      type: String,
+      default: '',
+    },
+    organizerBio: {
+      type: String,
+      default: '',
     },
     avatar: {
       url: { type: String, default: '' },
@@ -75,7 +93,31 @@ const userSchema = new mongoose.Schema(
     },
     emailVerified: {
       type: Boolean,
-      default: true,
+      default: false,
+    },
+    verificationCode: {
+      type: String,
+      default: null,
+    },
+    verificationCodeExpires: {
+      type: Date,
+      default: null,
+    },
+    resetPasswordToken: {
+      type: String,
+      default: null,
+    },
+    resetPasswordExpires: {
+      type: Date,
+      default: null,
+    },
+    acceptedTerms: {
+      type: Boolean,
+      default: false,
+    },
+    acceptedTermsAt: {
+      type: Date,
+      default: null,
     },
     suspensionReason: {
       type: String,

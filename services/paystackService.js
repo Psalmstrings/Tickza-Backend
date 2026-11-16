@@ -125,7 +125,11 @@ export const verifyTransaction = async (reference) => {
  */
 export const verifyWebhookSignature = (signature, rawBody) => {
   if (!signature || !rawBody) return false;
-  const secret = process.env.PAYSTACK_WEBHOOK_SECRET || getSecretKey();
+  let secret = process.env.PAYSTACK_WEBHOOK_SECRET || getSecretKey();
+  // Guard: if PAYSTACK_WEBHOOK_SECRET was accidentally configured with a webhook URL, fallback to Secret Key
+  if (!secret || secret.startsWith('http://') || secret.startsWith('https://')) {
+    secret = getSecretKey();
+  }
   if (!secret) return false;
 
   const expectedSignature = crypto
@@ -315,6 +319,78 @@ export const verifyTransfer = async (referenceOrCode) => {
   };
 };
 
+/**
+ * 9. Initiate a Paystack Refund
+ * @param {Object} params
+ * @param {string|number} params.transactionReference - Paystack transaction reference or ID
+ * @param {number} [params.amountInKobo] - Amount to refund in kobo (omit for full refund)
+ * @param {string} [params.merchantNote] - Internal reason for refund
+ * @param {string} [params.customerNote] - Reason shown to customer
+ */
+export const createRefund = async ({
+  transactionReference,
+  amountInKobo,
+  merchantNote = 'Tickza order cancellation refund',
+  customerNote = 'Your Tickza event ticket order has been refunded.',
+}) => {
+  if (!transactionReference) {
+    throw new Error('Transaction reference or ID is required to initiate a refund.');
+  }
+
+  const payload = {
+    transaction: transactionReference,
+    currency: 'NGN',
+    merchant_note: merchantNote,
+    customer_note: customerNote,
+  };
+
+  if (amountInKobo && Number(amountInKobo) > 0) {
+    payload.amount = Math.round(Number(amountInKobo));
+  }
+
+  const result = await paystackRequest('/refund', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+
+  const refData = result.data;
+  return {
+    success: result.status,
+    id: refData?.id,
+    status: refData?.status, // 'pending', 'processing', 'success', 'failed'
+    amount: refData?.amount,
+    currency: refData?.currency,
+    transactionReference: refData?.transaction?.reference || transactionReference,
+    refundedAt: refData?.createdAt ? new Date(refData.createdAt) : new Date(),
+    raw: refData,
+  };
+};
+
+/**
+ * 10. Fetch and verify a Paystack Refund status
+ * @param {string|number} refundId - The refund ID or reference
+ */
+export const verifyRefund = async (refundId) => {
+  if (!refundId) {
+    throw new Error('Refund ID or reference is required.');
+  }
+
+  const result = await paystackRequest(`/refund/${encodeURIComponent(refundId)}`, {
+    method: 'GET',
+  });
+
+  const refData = result.data;
+  return {
+    success: result.status,
+    id: refData?.id,
+    status: refData?.status,
+    amount: refData?.amount,
+    currency: refData?.currency,
+    transactionReference: refData?.transaction?.reference,
+    raw: refData,
+  };
+};
+
 export default {
   initializeTransaction,
   verifyTransaction,
@@ -324,4 +400,6 @@ export default {
   createTransferRecipient,
   initiateTransfer,
   verifyTransfer,
+  createRefund,
+  verifyRefund,
 };

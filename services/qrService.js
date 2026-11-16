@@ -1,7 +1,7 @@
 import QRCode from 'qrcode';
 import crypto from 'crypto';
 
-const QR_SECRET = process.env.JWT_SECRET || 'tickapp_qr_secret_salt_2026';
+const getQrSecret = () => process.env.JWT_SECRET || 'tickapp_qr_secret_salt_2026';
 
 /**
  * Generate a cryptographically secure signed ticket QR token
@@ -10,7 +10,7 @@ export const generateSecureQRToken = (ticketId, eventId, ownerId) => {
   const nonce = crypto.randomBytes(12).toString('hex');
   const payload = `${ticketId}:${eventId}:${ownerId}:${nonce}`;
   const signature = crypto
-    .createHmac('sha256', QR_SECRET)
+    .createHmac('sha256', getQrSecret())
     .update(payload)
     .digest('hex');
   return `TICKZA-V1.${Buffer.from(payload).toString('base64url')}.${signature.slice(0, 16)}`;
@@ -28,7 +28,7 @@ export const verifySecureQRToken = (token) => {
     const payload = Buffer.from(parts[1], 'base64url').toString();
     const signature = parts[2];
     const expectedSig = crypto
-      .createHmac('sha256', QR_SECRET)
+      .createHmac('sha256', getQrSecret())
       .update(payload)
       .digest('hex')
       .slice(0, 16);
