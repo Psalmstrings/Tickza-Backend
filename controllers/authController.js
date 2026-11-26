@@ -258,12 +258,16 @@ export const resendVerification = async (req, res) => {
     user.verificationCodeExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
     await user.save();
 
-    await sendVerificationEmail({
-      to: user.email,
-      name: user.firstName,
-      verificationCode,
-      req,
-    });
+    try {
+      await sendVerificationEmail({
+        to: user.email,
+        name: user.firstName,
+        verificationCode,
+        req,
+      });
+    } catch (mailError) {
+      console.error('[Resend Verification] Mail Error:', mailError.message);
+    }
 
     return res.json({
       success: true,

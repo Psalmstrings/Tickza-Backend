@@ -5,7 +5,7 @@ import nodemailer from 'nodemailer';
  */
 const getCleanEnv = () => {
   const user = (process.env.EMAIL_USER || '').trim().replace(/^["']|["']$/g, '');
-  // Strip quotes and internal whitespace from Google App Passwords
+  // Strip quotes and internal whitespace from passwords/keys
   const pass = (process.env.EMAIL_PASS || '').replace(/["'\s]/g, '');
   const service = (process.env.EMAIL_SERVICE || 'gmail').trim().replace(/^["']|["']$/g, '');
   const host = (process.env.EMAIL_HOST || 'smtp.gmail.com').trim().replace(/^["']|["']$/g, '');
@@ -14,7 +14,21 @@ const getCleanEnv = () => {
     ? (process.env.EMAIL_SECURE === 'true' || process.env.EMAIL_SECURE === true)
     : (port === 465);
 
-  return { user, pass, service, host, port, secure };
+  const resendApiKey = (process.env.RESEND_API_KEY || '').trim().replace(/^["']|["']$/g, '');
+  const brevoApiKey = (process.env.BREVO_API_KEY || '').trim().replace(/^["']|["']$/g, '');
+  const sendgridApiKey = (process.env.SENDGRID_API_KEY || '').trim().replace(/^["']|["']$/g, '');
+
+  return {
+    user,
+    pass,
+    service,
+    host,
+    port,
+    secure,
+    resendApiKey,
+    brevoApiKey,
+    sendgridApiKey,
+  };
 };
 
 /**
@@ -22,7 +36,6 @@ const getCleanEnv = () => {
  * Ensures verification and password reset links never point to localhost in production.
  */
 export const resolveClientUrl = (req) => {
-  // 1. If request object is available, extract origin or referer header
   if (req) {
     const origin = req.get ? req.get('origin') : (req.headers && req.headers.origin);
     if (origin && typeof origin === 'string' && origin.startsWith('http')) {
@@ -33,13 +46,10 @@ export const resolveClientUrl = (req) => {
       try {
         const u = new URL(referer);
         return u.origin;
-      } catch (e) {
-        // Fall through on malformed URL
-      }
+      } catch (e) {}
     }
   }
 
-  // 2. Explicit CLIENT_URL environment variable if set to a non-localhost URL
   if (process.env.CLIENT_URL && process.env.CLIENT_URL.trim()) {
     const envUrl = process.env.CLIENT_URL.trim().replace(/\/+$/, '');
     if (!envUrl.includes('localhost') || process.env.NODE_ENV === 'development') {
@@ -47,18 +57,107 @@ export const resolveClientUrl = (req) => {
     }
   }
 
-  // 3. Known production frontend domain
   if (process.env.NODE_ENV === 'production' || process.env.VERCEL) {
     return 'https://tickza.vercel.app';
   }
 
-  // 4. Default development fallback
   return process.env.CLIENT_URL || 'http://localhost:5173';
 };
 
-/**
- * Creates primary and fallback transporters.
- */
+const getFromAddress = () => {
+  const { user } = getCleanEnv();
+  if (process.env.EMAIL_FROM && process.env.EMAIL_FROM.includes('@')) {
+    return process.env.EMAIL_FROM.replace(/"/g, '');
+  }
+  return `Tickza <${user || 'onboarding@resend.dev'}>`;
+};
+
+// ── HTTP API Transporters (Port 443 — Bypasses Cloud Host SMTP Port Blocks) ─────
+
+const sendViaResend = async ({ apiKey, to, subject, html, text }) => {
+  const fromAddress = process.env.EMAIL_FROM && !process.env.EMAIL_FROM.includes('gmail.com')
+    ? process.env.EMAIL_FROM.replace(/"/g, '')
+    : 'Tickza <onboarding@resend.dev>';
+
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: fromAddress,
+      to: [to],
+      subject,
+      html,
+      text,
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.message || data.error || `Resend Error (${response.status})`);
+  }
+  return { success: true, messageId: data.id, provider: 'Resend (HTTPS Port 443)' };
+};
+
+const sendViaBrevo = async ({ apiKey, to, subject, html, text }) => {
+  const { user } = getCleanEnv();
+  const senderEmail = user || 'no-reply@tickza.com';
+
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': apiKey,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify({
+      sender: { name: 'Tickza', email: senderEmail },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+      textContent: text,
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.message || `Brevo Error (${response.status})`);
+  }
+  return { success: true, messageId: data.messageId, provider: 'Brevo (HTTPS Port 443)' };
+};
+
+const sendViaSendGrid = async ({ apiKey, to, subject, html, text }) => {
+  const { user } = getCleanEnv();
+  const senderEmail = user || 'no-reply@tickza.com';
+
+  const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      personalizations: [{ to: [{ email: to }] }],
+      from: { email: senderEmail, name: 'Tickza' },
+      subject,
+      content: [
+        { type: 'text/plain', value: text },
+        { type: 'text/html', value: html },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`SendGrid Error (${response.status}): ${errorText}`);
+  }
+  return { success: true, provider: 'SendGrid (HTTPS Port 443)' };
+};
+
+// ── Standard SMTP Transporters (Nodemailer) ───────────────────────────────────
+
 const getTransporters = () => {
   const { user, pass, service, host, port, secure } = getCleanEnv();
 
@@ -66,15 +165,14 @@ const getTransporters = () => {
     return { primary: null, fallback: null };
   }
 
-  // Primary transporter: built-in service if gmail, or configured host/port
   let primary;
   if (service.toLowerCase() === 'gmail' && host === 'smtp.gmail.com') {
     primary = nodemailer.createTransport({
       service: 'gmail',
       auth: { user, pass },
       tls: { rejectUnauthorized: false },
-      connectionTimeout: 10000,
-      greetingTimeout: 10000,
+      connectionTimeout: 8000,
+      greetingTimeout: 8000,
     });
   } else {
     primary = nodemailer.createTransport({
@@ -83,41 +181,48 @@ const getTransporters = () => {
       secure,
       auth: { user, pass },
       tls: { rejectUnauthorized: false },
-      connectionTimeout: 10000,
-      greetingTimeout: 10000,
+      connectionTimeout: 8000,
+      greetingTimeout: 8000,
     });
   }
 
-  // Fallback transporter: Port 587 STARTTLS (widely permitted across cloud providers)
   const fallback = nodemailer.createTransport({
     host: host || 'smtp.gmail.com',
     port: 587,
     secure: false, // STARTTLS
     auth: { user, pass },
     tls: { rejectUnauthorized: false },
-    connectionTimeout: 10000,
-    greetingTimeout: 10000,
+    connectionTimeout: 8000,
+    greetingTimeout: 8000,
   });
 
   return { primary, fallback };
-};
-
-const getFromAddress = () => {
-  const { user } = getCleanEnv();
-  if (process.env.EMAIL_FROM && process.env.EMAIL_FROM.includes('@')) {
-    return process.env.EMAIL_FROM.replace(/"/g, '');
-  }
-  return `Tickza <${user || 'no-reply@tickza.com'}>`;
 };
 
 /**
  * Verifies email service connectivity on application startup.
  */
 export const verifyEmailTransporter = async () => {
-  const { user, pass } = getCleanEnv();
+  const { user, pass, resendApiKey, brevoApiKey, sendgridApiKey } = getCleanEnv();
+
+  // 1. Check HTTP API providers first (Immune to Render SMTP port blocks)
+  if (resendApiKey) {
+    console.log('✓ [Email Service] Resend HTTPS API configured (Port 443). Active & port-block immune.');
+    return true;
+  }
+  if (brevoApiKey) {
+    console.log('✓ [Email Service] Brevo HTTPS API configured (Port 443). Active & port-block immune.');
+    return true;
+  }
+  if (sendgridApiKey) {
+    console.log('✓ [Email Service] SendGrid HTTPS API configured (Port 443). Active & port-block immune.');
+    return true;
+  }
+
+  // 2. SMTP Check
   if (!user || !pass) {
-    console.warn('\n⚠️  [Email Service] Warning: EMAIL_USER or EMAIL_PASS not detected in environment.');
-    console.warn('   Email delivery will run in SIMULATION mode until credentials are provided in .env\n');
+    console.warn('\n⚠️  [Email Service] Notice: No email API key or SMTP credentials detected.');
+    console.warn('   Emails will run in console SIMULATION mode until configured.\n');
     return false;
   }
 
@@ -134,20 +239,66 @@ export const verifyEmailTransporter = async () => {
       return true;
     } catch (fallbackErr) {
       console.error(`✗ [Email Service] Fallback transport verification failed: ${fallbackErr.message}`);
+      if (fallbackErr.message.includes('timeout') || fallbackErr.message.includes('ETIMEDOUT')) {
+        console.warn('\n💡 [Email Tip] Outbound SMTP ports (465, 587) appear to be blocked by your host (e.g. Render Free plan).');
+        console.warn('   To send emails without port blocks, add a free RESEND_API_KEY (from resend.com) or BREVO_API_KEY (from brevo.com) to your environment.\n');
+      }
       return false;
     }
   }
 };
 
 /**
- * Send an email with automatic fallback (Primary -> STARTTLS) and console simulation when unconfigured.
+ * Master send email function with multi-tier delivery:
+ * Tier 1: Resend HTTP API (Port 443)
+ * Tier 2: Brevo HTTP API (Port 443)
+ * Tier 3: SendGrid HTTP API (Port 443)
+ * Tier 4: Primary Nodemailer SMTP
+ * Tier 5: Fallback Nodemailer STARTTLS
+ * Tier 6: Console simulation fallback
  */
 export const sendMail = async ({ to, subject, html, text }) => {
+  const { user, pass, resendApiKey, brevoApiKey, sendgridApiKey } = getCleanEnv();
+
+  // Tier 1: Resend HTTPS API
+  if (resendApiKey) {
+    try {
+      const res = await sendViaResend({ apiKey: resendApiKey, to, subject, html, text });
+      console.log(`✓ [Email Sent] Message to ${to} sent via Resend API: ${res.messageId}`);
+      return res;
+    } catch (err) {
+      console.error(`[Email Error] Resend API failed: ${err.message}. Trying next provider...`);
+    }
+  }
+
+  // Tier 2: Brevo HTTPS API
+  if (brevoApiKey) {
+    try {
+      const res = await sendViaBrevo({ apiKey: brevoApiKey, to, subject, html, text });
+      console.log(`✓ [Email Sent] Message to ${to} sent via Brevo API: ${res.messageId}`);
+      return res;
+    } catch (err) {
+      console.error(`[Email Error] Brevo API failed: ${err.message}. Trying next provider...`);
+    }
+  }
+
+  // Tier 3: SendGrid HTTPS API
+  if (sendgridApiKey) {
+    try {
+      const res = await sendViaSendGrid({ apiKey: sendgridApiKey, to, subject, html, text });
+      console.log(`✓ [Email Sent] Message to ${to} sent via SendGrid API`);
+      return res;
+    } catch (err) {
+      console.error(`[Email Error] SendGrid API failed: ${err.message}. Trying next provider...`);
+    }
+  }
+
+  // Tier 4 & 5: Nodemailer SMTP
   const { primary, fallback } = getTransporters();
 
   if (!primary) {
     console.log('\n======================================================');
-    console.log('✉️  [EMAIL SIMULATION] Email credentials not detected in environment');
+    console.log('✉️  [EMAIL SIMULATION] No email credentials detected in environment');
     console.log(`To:      ${to}`);
     console.log(`Subject: ${subject}`);
     console.log('------------------------------------------------------');
@@ -164,21 +315,19 @@ export const sendMail = async ({ to, subject, html, text }) => {
     html,
   };
 
-  // Attempt 1: Primary Transporter
   try {
     const info = await primary.sendMail(mailOptions);
-    console.log(`✓ [Email Sent] Message to ${to} sent successfully: ${info.messageId}`);
+    console.log(`✓ [Email Sent] Message to ${to} sent successfully via SMTP: ${info.messageId}`);
     return { success: true, messageId: info.messageId, simulated: false };
   } catch (primaryError) {
-    console.warn(`[Email Notice] Primary SMTP attempt to ${to} failed: ${primaryError.message}. Attempting fallback port 587...`);
+    console.warn(`[Email Notice] Primary SMTP to ${to} failed: ${primaryError.message}. Trying fallback port 587...`);
 
-    // Attempt 2: Fallback Transporter
     try {
       const info = await fallback.sendMail(mailOptions);
-      console.log(`✓ [Email Sent - Fallback] Message to ${to} sent successfully via fallback: ${info.messageId}`);
+      console.log(`✓ [Email Sent - Fallback] Message to ${to} sent via fallback: ${info.messageId}`);
       return { success: true, messageId: info.messageId, simulated: false, viaFallback: true };
     } catch (fallbackError) {
-      console.error(`✗ [Email Error] Both primary and fallback email attempts to ${to} failed.`);
+      console.error(`✗ [Email Error] Both primary and fallback SMTP to ${to} failed.`);
       console.error(`   Primary error:  ${primaryError.message}`);
       console.error(`   Fallback error: ${fallbackError.message}`);
       throw fallbackError;
