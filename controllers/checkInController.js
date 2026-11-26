@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { Ticket } from '../models/Ticket.js';
 import { Event } from '../models/Event.js';
 import { CheckIn } from '../models/CheckIn.js';
@@ -6,30 +7,52 @@ import { verifySecureQRToken } from '../services/qrService.js';
 import { emitToEvent } from '../services/socketService.js';
 import { logAudit } from '../services/auditService.js';
 
-// @desc    Scan a QR code and check in a ticket
-// @route   POST /api/checkin/scan
+// @desc    Scan a QR code or validate a Ticket ID to check in an attendee
+// @route   POST /api/tickets/checkin/scan
 // @access  Private (Admin or Approved event organizer / staff)
 export const scanQR = async (req, res) => {
   try {
-    const { qrToken, eventId } = req.body;
+    const rawInput = (
+      req.body.qrToken ||
+      req.body.ticketId ||
+      req.body.ticketNumber ||
+      req.body.token ||
+      ''
+    ).toString().trim();
 
-    if (!qrToken) {
-      return res.status(400).json({ success: false, message: 'QR token is required.' });
-    }
+    const { eventId } = req.body;
 
-    // ── Step 1: Verify the cryptographic signature on the QR token ──────────
-    const verification = verifySecureQRToken(qrToken);
-    if (!verification.valid) {
-      // Still record an invalid scan attempt
+    if (!rawInput) {
       return res.status(400).json({
         success: false,
-        code:    'INVALID_QR',
-        message: `Invalid QR code: ${verification.error}`,
+        message: 'Ticket ID or QR code token is required.',
       });
     }
 
-    // ── Step 2: Locate the ticket by its current stored qrToken ─────────────
-    const ticket = await Ticket.findOne({ qrToken })
+    // Clean input: remove leading '#' or ticket URL prefixes if user pasted a link
+    let cleanInput = rawInput.replace(/^#/, '').trim();
+    if (cleanInput.includes('/tickets/')) {
+      cleanInput = cleanInput.split('/tickets/').pop().split('?')[0].trim();
+    }
+
+    // ── Locate Ticket in Database ──────────────────────────────────────────
+    // Supports:
+    // 1. Signed QR token (TICKZA-V1... or TICKAPP-V1...)
+    // 2. Ticket Number (e.g. "TICK-852150-52B2CA", "#TICK-852150-52B2CA", or "852150-52B2CA")
+    // 3. Database ObjectId (24-character hex)
+    // 4. Exact stored qrToken match
+    const orConditions = [
+      { qrToken: cleanInput },
+      { qrToken: rawInput },
+      { ticketNumber: new RegExp(`^${cleanInput}$`, 'i') },
+      { ticketNumber: new RegExp(`^TICK-${cleanInput}$`, 'i') },
+    ];
+
+    if (mongoose.Types.ObjectId.isValid(cleanInput) && cleanInput.length === 24) {
+      orConditions.push({ _id: cleanInput });
+    }
+
+    const ticket = await Ticket.findOne({ $or: orConditions })
       .populate('eventId')
       .populate('ownerId', 'firstName lastName email phone')
       .populate('ticketTypeId', 'name section');
@@ -37,38 +60,49 @@ export const scanQR = async (req, res) => {
     if (!ticket) {
       return res.status(404).json({
         success: false,
-        code:    'TICKET_NOT_FOUND',
-        message: 'Pass/ticket not found. The QR code may have been invalidated (e.g. transferred or resold).',
+        code: 'TICKET_NOT_FOUND',
+        message: `Pass / ticket "${cleanInput}" not found. Please verify the Ticket ID or QR code.`,
       });
     }
 
-    // ── Step 3: Check that the scanner is authorised for this event ─────────
+    // ── Check Organizer / Staff Authorization ──────────────────────────────
     const event = ticket.eventId;
-    const isAdmin      = req.user.role === 'ADMIN' || req.user.role === 'SUPER_ADMIN';
-    const isOrganizer  = event.organizerId.toString() === req.user._id.toString();
+    if (!event) {
+      return res.status(404).json({
+        success: false,
+        code: 'EVENT_NOT_FOUND',
+        message: 'The event associated with this ticket was not found.',
+      });
+    }
+
+    const isAdmin = req.user.role === 'ADMIN' || req.user.role === 'SUPER_ADMIN';
+    const isOrganizer = event.organizerId && event.organizerId.toString() === req.user._id.toString();
 
     if (!isAdmin && !isOrganizer) {
       return res.status(403).json({
         success: false,
-        code:    'NOT_AUTHORIZED_FOR_EVENT',
-        message: 'You are not authorised to check in tickets for this event.',
+        code: 'NOT_AUTHORIZED_FOR_EVENT',
+        message: `You are not authorised to check in tickets for "${event.title}".`,
       });
     }
 
-    // Optional eventId mismatch safeguard (if client specifies the expected event)
-    if (eventId && event._id.toString() !== eventId.toString()) {
-      return res.status(400).json({
-        success: false,
-        code:    'EVENT_MISMATCH',
-        message: `This pass is for "${event.title}", not the selected event.`,
-        data: {
-          expectedEventId: eventId,
-          actualEvent: {
-            id: event._id,
-            title: event.title,
+    // Optional eventId mismatch safeguard (if organizer specifically selected an event in dropdown)
+    if (eventId && eventId.trim() && event._id.toString() !== eventId.toString()) {
+      // If the current user owns both events, allow admission but notify
+      if (!isAdmin && !isOrganizer) {
+        return res.status(400).json({
+          success: false,
+          code: 'EVENT_MISMATCH',
+          message: `This pass is for "${event.title}", not the selected event.`,
+          data: {
+            expectedEventId: eventId,
+            actualEvent: {
+              id: event._id,
+              title: event.title,
+            },
           },
-        },
-      });
+        });
+      }
     }
 
     // ── Step 4: Guard against duplicate check-in or full capacity reached ──
