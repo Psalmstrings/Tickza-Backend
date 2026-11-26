@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { Event } from '../models/Event.js';
 import { TicketType } from '../models/TicketType.js';
 import { processUpload } from '../middleware/uploadMiddleware.js';
@@ -365,5 +366,114 @@ export const uploadEventMedia = async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Get SEO and Open Graph metadata / preview for an event
+// @route   GET /api/events/:id/seo
+// @access  Public
+export const getEventSeoPreview = async (req, res) => {
+  try {
+    const { id } = req.params;
+    let event = null;
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      event = await Event.findById(id).lean();
+    }
+    if (!event) {
+      event = await Event.findOne({ slug: id }).lean();
+    }
+    if (!event) {
+      return res.status(404).send('Event not found');
+    }
+
+    const clientUrl = process.env.CLIENT_URL || 'https://tickza.vercel.app';
+    const canonicalUrl = `${clientUrl}/events/${event._id}`;
+    const title = `${event.title} | Tickza Tickets`;
+
+    let dateStr = '';
+    if (event.startDate) {
+      const d = new Date(event.startDate);
+      dateStr = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+      if (event.startTime) dateStr += ` at ${event.startTime}`;
+    }
+
+    const venueStr = event.venue || event.address || '';
+    const parts = [];
+    if (dateStr) parts.push(`📅 ${dateStr}`);
+    if (venueStr) parts.push(`📍 ${venueStr}`);
+    if (event.admissionType === 'FREE') parts.push('🎟️ FREE Admission');
+
+    let description = parts.join(' • ');
+    if (event.description) {
+      const clean = event.description.replace(/<[^>]*>?/gm, '').trim();
+      description += description ? ` — ${clean.slice(0, 160)}` : clean.slice(0, 200);
+    }
+    if (!description) description = 'Discover and book tickets on Tickza.';
+
+    let imageUrl = event.coverImage?.url || event.thumbnail?.url || `${clientUrl}/tickza-official-logo.jpg`;
+    if (imageUrl.startsWith('/')) imageUrl = `${clientUrl}${imageUrl}`;
+
+    if (req.headers.accept?.includes('application/json')) {
+      return res.json({
+        success: true,
+        seo: {
+          title,
+          description,
+          imageUrl,
+          canonicalUrl,
+          type: 'event',
+        },
+      });
+    }
+
+    const escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const safeTitle = escapeHtml(title);
+    const safeDesc = escapeHtml(description);
+    const safeImage = escapeHtml(imageUrl);
+    const safeUrl = escapeHtml(canonicalUrl);
+
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>${safeTitle}</title>
+  <meta name="description" content="${safeDesc}">
+  <link rel="canonical" href="${safeUrl}">
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="${safeUrl}">
+  <meta property="og:site_name" content="Tickza">
+  <meta property="og:title" content="${safeTitle}">
+  <meta property="og:description" content="${safeDesc}">
+  <meta property="og:image" content="${safeImage}">
+  <meta property="og:image:secure_url" content="${safeImage}">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:site" content="@Tickza">
+  <meta name="twitter:title" content="${safeTitle}">
+  <meta name="twitter:description" content="${safeDesc}">
+  <meta name="twitter:image" content="${safeImage}">
+
+  <meta http-equiv="refresh" content="0;url=${safeUrl}">
+  <script>window.location.replace(${JSON.stringify(canonicalUrl)});</script>
+</head>
+<body>
+  <h1>${safeTitle}</h1>
+  <p>${safeDesc}</p>
+  <img src="${safeImage}" alt="${safeTitle}" style="max-width:100%; height:auto;" />
+  <p><a href="${safeUrl}">View on Tickza</a></p>
+</body>
+</html>`;
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=1800, s-maxage=3600');
+    return res.status(200).send(html);
+  } catch (error) {
+    console.error('[SEO Preview Error]', error);
+    return res.status(500).send('Error generating preview: ' + error.message);
   }
 };

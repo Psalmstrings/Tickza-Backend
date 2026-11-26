@@ -16,6 +16,7 @@ import morgan from 'morgan';
 import { connectDB } from './config/db.js';
 import { initSocket } from './services/socketService.js';
 import { seedAdmin } from './utils/seed.js';
+import { verifyEmailTransporter } from './services/emailService.js';
 
 // ── Route imports ─────────────────────────────────────────────────────────────
 import authRoutes         from './routes/authRoutes.js';
@@ -46,12 +47,15 @@ const allowedOrigins = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'https://ticket-app-frontend.vercel.app',
+  'https://tickza.vercel.app',
 ];
 
 const isAllowedOrigin = (origin) => {
   if (!origin) return true;
   if (allowedOrigins.includes(origin)) return true;
   if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return true;
+  if (/^https:\/\/([a-zA-Z0-9_-]+\.)?vercel\.app$/.test(origin)) return true;
+  if (/^https:\/\/([a-zA-Z0-9_-]+\.)?tickza\.com$/.test(origin)) return true;
   return false;
 };
 
@@ -182,6 +186,9 @@ app.use((err, req, res, next) => {
 const start = async () => {
   try {
     await connectDB();
+
+    // Verify email service connectivity
+    await verifyEmailTransporter();
 
     // Seed the default admin user if none exists
     await seedAdmin();

@@ -4,6 +4,7 @@ import {
   getTicketById,
   createTicket,
   searchTicketmaster,
+  getTicketSeoPreview,
 } from '../controllers/ticketController.js';
 import { scanQR } from '../controllers/checkInController.js';
 import { protect, requireApproved } from '../middleware/authMiddleware.js';
@@ -21,6 +22,9 @@ router.post('/checkin/scan', protect, scanQR);
 
 // @route   GET  /api/tickets/:id                  — Private: single ticket by ID
 router.get('/:id', protect, getTicketById);
+
+// @route   GET  /api/tickets/:id/seo              — Public: Open Graph & SEO preview
+router.get('/:id/seo', getTicketSeoPreview);
 
 // @route   POST /api/tickets                      — Private (Approved): manually create ticket(s)
 router.post('/', protect, requireApproved, createTicket);

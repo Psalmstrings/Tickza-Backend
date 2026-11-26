@@ -5,6 +5,7 @@ import {
   createEvent,
   getOrganizerEvents,
   uploadEventMedia,
+  getEventSeoPreview,
 } from '../controllers/eventController.js';
 import {
   updateOrganizerEvent,
@@ -34,6 +35,9 @@ router.post(
 
 // @route   GET  /api/events/:id      — Public: single event by ID or slug
 router.get('/:id', getEventById);
+
+// @route   GET  /api/events/:id/seo  — Public: Open Graph & SEO preview
+router.get('/:id/seo', getEventSeoPreview);
 
 // @route   POST /api/events          — Private (Approved): create new event
 router.post('/', protect, requireApproved, createEvent);

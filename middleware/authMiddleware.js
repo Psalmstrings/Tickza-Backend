@@ -31,6 +31,15 @@ export const protect = async (req, res, next) => {
         });
       }
 
+      if (!user.emailVerified) {
+        return res.status(403).json({
+          success: false,
+          code: 'EMAIL_NOT_VERIFIED',
+          message: 'Please verify your email address to access your account.',
+          email: user.email,
+        });
+      }
+
       req.user = user;
       next();
     } catch (error) {

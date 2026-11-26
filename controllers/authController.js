@@ -74,12 +74,14 @@ export const register = async (req, res) => {
       },
     });
 
-    // Send verification email via Gmail
+    // Send verification email via Gmail / SMTP with fallback
+    let mailResult = { success: false };
     try {
-      await sendVerificationEmail({
+      mailResult = await sendVerificationEmail({
         to: user.email,
         name: user.firstName,
         verificationCode,
+        req,
       });
     } catch (mailError) {
       console.error('[Register] Notice: Verification email sending encountered an error:', mailError.message);
@@ -106,7 +108,11 @@ export const register = async (req, res) => {
     return res.status(201).json({
       success: true,
       requiresVerification: true,
-      message: 'Account created! Please enter the 6-digit verification code sent to your Gmail.',
+      emailSent: mailResult?.success && !mailResult?.simulated,
+      simulated: Boolean(mailResult?.simulated),
+      message: mailResult?.success && !mailResult?.simulated
+        ? 'Account created! A 6-digit confirmation code has been sent to your email.'
+        : 'Account created! Please enter the 6-digit verification code to activate your account.',
       email: user.email,
       user: {
         id: user._id,
@@ -256,6 +262,7 @@ export const resendVerification = async (req, res) => {
       to: user.email,
       name: user.firstName,
       verificationCode,
+      req,
     });
 
     return res.json({
@@ -309,6 +316,7 @@ export const login = async (req, res) => {
           to: user.email,
           name: user.firstName,
           verificationCode: user.verificationCode,
+          req,
         }).catch((e) => console.error('[Login Verification Email]', e.message));
       }
 
@@ -452,6 +460,7 @@ export const forgotPassword = async (req, res) => {
         to: user.email,
         name: user.firstName,
         resetToken,
+        req,
       });
     } catch (mailError) {
       console.error('[Forgot Password] Mail Error:', mailError.message);
@@ -514,6 +523,9 @@ export const resetPassword = async (req, res) => {
     user.passwordHash = await bcrypt.hash(newPassword, salt);
     user.resetPasswordToken = null;
     user.resetPasswordExpires = null;
+    user.emailVerified = true;
+    user.verificationCode = null;
+    user.verificationCodeExpires = null;
     await user.save();
 
     await logAudit({

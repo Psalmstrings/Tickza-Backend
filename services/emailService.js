@@ -1,36 +1,109 @@
 import nodemailer from 'nodemailer';
 
 /**
- * Creates and returns the Nodemailer transporter.
- * Uses Gmail by default when EMAIL_USER and EMAIL_PASS are set.
+ * Clean and extract environment variables
  */
-const getTransporter = () => {
-  const user = (process.env.EMAIL_USER || '').trim();
-  // Strip whitespace from Google App Passwords
-  const pass = (process.env.EMAIL_PASS || '').replace(/\s+/g, '');
+const getCleanEnv = () => {
+  const user = (process.env.EMAIL_USER || '').trim().replace(/^["']|["']$/g, '');
+  // Strip quotes and internal whitespace from Google App Passwords
+  const pass = (process.env.EMAIL_PASS || '').replace(/["'\s]/g, '');
+  const service = (process.env.EMAIL_SERVICE || 'gmail').trim().replace(/^["']|["']$/g, '');
+  const host = (process.env.EMAIL_HOST || 'smtp.gmail.com').trim().replace(/^["']|["']$/g, '');
+  const port = process.env.EMAIL_PORT ? parseInt(process.env.EMAIL_PORT, 10) : 465;
+  const secure = process.env.EMAIL_SECURE !== undefined
+    ? (process.env.EMAIL_SECURE === 'true' || process.env.EMAIL_SECURE === true)
+    : (port === 465);
 
-  if (!user || !pass) {
-    return null;
+  return { user, pass, service, host, port, secure };
+};
+
+/**
+ * Resolves the client URL dynamically from the incoming request or environment.
+ * Ensures verification and password reset links never point to localhost in production.
+ */
+export const resolveClientUrl = (req) => {
+  // 1. If request object is available, extract origin or referer header
+  if (req) {
+    const origin = req.get ? req.get('origin') : (req.headers && req.headers.origin);
+    if (origin && typeof origin === 'string' && origin.startsWith('http')) {
+      return origin.replace(/\/+$/, '');
+    }
+    const referer = req.get ? req.get('referer') : (req.headers && req.headers.referer);
+    if (referer && typeof referer === 'string' && referer.startsWith('http')) {
+      try {
+        const u = new URL(referer);
+        return u.origin;
+      } catch (e) {
+        // Fall through on malformed URL
+      }
+    }
   }
 
-  // Gmail service configuration with robust connection settings
-  return nodemailer.createTransport({
-    service: 'gmail',
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true,
-    auth: {
-      user,
-      pass,
-    },
-    tls: {
-      rejectUnauthorized: false,
-    },
+  // 2. Explicit CLIENT_URL environment variable if set to a non-localhost URL
+  if (process.env.CLIENT_URL && process.env.CLIENT_URL.trim()) {
+    const envUrl = process.env.CLIENT_URL.trim().replace(/\/+$/, '');
+    if (!envUrl.includes('localhost') || process.env.NODE_ENV === 'development') {
+      return envUrl;
+    }
+  }
+
+  // 3. Known production frontend domain
+  if (process.env.NODE_ENV === 'production' || process.env.VERCEL) {
+    return 'https://tickza.vercel.app';
+  }
+
+  // 4. Default development fallback
+  return process.env.CLIENT_URL || 'http://localhost:5173';
+};
+
+/**
+ * Creates primary and fallback transporters.
+ */
+const getTransporters = () => {
+  const { user, pass, service, host, port, secure } = getCleanEnv();
+
+  if (!user || !pass) {
+    return { primary: null, fallback: null };
+  }
+
+  // Primary transporter: built-in service if gmail, or configured host/port
+  let primary;
+  if (service.toLowerCase() === 'gmail' && host === 'smtp.gmail.com') {
+    primary = nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user, pass },
+      tls: { rejectUnauthorized: false },
+      connectionTimeout: 10000,
+      greetingTimeout: 10000,
+    });
+  } else {
+    primary = nodemailer.createTransport({
+      host,
+      port,
+      secure,
+      auth: { user, pass },
+      tls: { rejectUnauthorized: false },
+      connectionTimeout: 10000,
+      greetingTimeout: 10000,
+    });
+  }
+
+  // Fallback transporter: Port 587 STARTTLS (widely permitted across cloud providers)
+  const fallback = nodemailer.createTransport({
+    host: host || 'smtp.gmail.com',
+    port: 587,
+    secure: false, // STARTTLS
+    auth: { user, pass },
+    tls: { rejectUnauthorized: false },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
   });
+
+  return { primary, fallback };
 };
 
 const getFromAddress = () => {
-  const user = (process.env.EMAIL_USER || '').trim();
+  const { user } = getCleanEnv();
   if (process.env.EMAIL_FROM && process.env.EMAIL_FROM.includes('@')) {
     return process.env.EMAIL_FROM.replace(/"/g, '');
   }
@@ -38,14 +111,43 @@ const getFromAddress = () => {
 };
 
 /**
- * Send an email with graceful fallback to console simulation in development/unconfigured environments.
+ * Verifies email service connectivity on application startup.
+ */
+export const verifyEmailTransporter = async () => {
+  const { user, pass } = getCleanEnv();
+  if (!user || !pass) {
+    console.warn('\n⚠️  [Email Service] Warning: EMAIL_USER or EMAIL_PASS not detected in environment.');
+    console.warn('   Email delivery will run in SIMULATION mode until credentials are provided in .env\n');
+    return false;
+  }
+
+  const { primary, fallback } = getTransporters();
+  try {
+    await primary.verify();
+    console.log(`✓ [Email Service] Connected to SMTP service (${user}). Email delivery is ACTIVE.`);
+    return true;
+  } catch (primaryErr) {
+    console.warn(`⚠️ [Email Service] Primary transport verification failed: ${primaryErr.message}`);
+    try {
+      await fallback.verify();
+      console.log(`✓ [Email Service] Fallback STARTTLS transport (Port 587) verified successfully.`);
+      return true;
+    } catch (fallbackErr) {
+      console.error(`✗ [Email Service] Fallback transport verification failed: ${fallbackErr.message}`);
+      return false;
+    }
+  }
+};
+
+/**
+ * Send an email with automatic fallback (Primary -> STARTTLS) and console simulation when unconfigured.
  */
 export const sendMail = async ({ to, subject, html, text }) => {
-  const transporter = getTransporter();
+  const { primary, fallback } = getTransporters();
 
-  if (!transporter) {
+  if (!primary) {
     console.log('\n======================================================');
-    console.log('✉️  [EMAIL SIMULATION] Gmail credentials not detected in .env');
+    console.log('✉️  [EMAIL SIMULATION] Email credentials not detected in environment');
     console.log(`To:      ${to}`);
     console.log(`Subject: ${subject}`);
     console.log('------------------------------------------------------');
@@ -54,27 +156,41 @@ export const sendMail = async ({ to, subject, html, text }) => {
     return { success: true, simulated: true };
   }
 
+  const mailOptions = {
+    from: getFromAddress(),
+    to,
+    subject,
+    text,
+    html,
+  };
+
+  // Attempt 1: Primary Transporter
   try {
-    const info = await transporter.sendMail({
-      from: getFromAddress(),
-      to,
-      subject,
-      text,
-      html,
-    });
-    console.log(`[Email Sent] Message to ${to} sent successfully: ${info.messageId}`);
-    return { success: true, messageId: info.messageId };
-  } catch (error) {
-    console.error(`[Email Error] Failed to send email to ${to}:`, error.message);
-    throw error;
+    const info = await primary.sendMail(mailOptions);
+    console.log(`✓ [Email Sent] Message to ${to} sent successfully: ${info.messageId}`);
+    return { success: true, messageId: info.messageId, simulated: false };
+  } catch (primaryError) {
+    console.warn(`[Email Notice] Primary SMTP attempt to ${to} failed: ${primaryError.message}. Attempting fallback port 587...`);
+
+    // Attempt 2: Fallback Transporter
+    try {
+      const info = await fallback.sendMail(mailOptions);
+      console.log(`✓ [Email Sent - Fallback] Message to ${to} sent successfully via fallback: ${info.messageId}`);
+      return { success: true, messageId: info.messageId, simulated: false, viaFallback: true };
+    } catch (fallbackError) {
+      console.error(`✗ [Email Error] Both primary and fallback email attempts to ${to} failed.`);
+      console.error(`   Primary error:  ${primaryError.message}`);
+      console.error(`   Fallback error: ${fallbackError.message}`);
+      throw fallbackError;
+    }
   }
 };
 
 /**
  * Send 6-Digit Email Verification Code & Link
  */
-export const sendVerificationEmail = async ({ to, name, verificationCode, verificationLink }) => {
-  const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+export const sendVerificationEmail = async ({ to, name, verificationCode, verificationLink, req }) => {
+  const clientUrl = verificationLink ? null : resolveClientUrl(req);
   const directLink = verificationLink || `${clientUrl}/verify-email?email=${encodeURIComponent(to)}&code=${verificationCode}`;
 
   const html = `
@@ -151,8 +267,8 @@ export const sendVerificationEmail = async ({ to, name, verificationCode, verifi
 /**
  * Send Password Reset Link & Code
  */
-export const sendPasswordResetEmail = async ({ to, name, resetToken, resetLink }) => {
-  const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+export const sendPasswordResetEmail = async ({ to, name, resetToken, resetLink, req }) => {
+  const clientUrl = resetLink ? null : resolveClientUrl(req);
   const directLink = resetLink || `${clientUrl}/reset-password?token=${resetToken}&email=${encodeURIComponent(to)}`;
 
   const html = `
