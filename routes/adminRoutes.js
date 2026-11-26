@@ -9,6 +9,9 @@ import {
   getAdminEvents,
   approveEvent,
   rejectEvent,
+  suspendEvent,
+  unsuspendEvent,
+  deleteAdminEvent,
   getAdminTickets,
   getAdminOrders,
   processAdminOrderRefund,
@@ -62,6 +65,15 @@ router.patch('/events/:id/approve', approveEvent);
 
 // @route  PATCH /api/admin/events/:id/reject
 router.patch('/events/:id/reject', rejectEvent);
+
+// @route  PATCH /api/admin/events/:id/suspend
+router.patch('/events/:id/suspend', suspendEvent);
+
+// @route  PATCH /api/admin/events/:id/unsuspend
+router.patch('/events/:id/unsuspend', unsuspendEvent);
+
+// @route  DELETE /api/admin/events/:id
+router.delete('/events/:id', deleteAdminEvent);
 
 // ── Tickets ────────────────────────────────────────────────────────────────
 // @route  GET /api/admin/tickets

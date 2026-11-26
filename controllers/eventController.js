@@ -126,6 +126,17 @@ export const getEventById = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Event not found' });
     }
 
+    // Suspended or Deleted events must not be displayed to the public
+    const isAdmin = req.user && (req.user.role === 'ADMIN' || req.user.role === 'SUPER_ADMIN');
+    const isOwner = req.user && event.organizerId && event.organizerId._id.toString() === req.user._id.toString();
+    if ((event.status === 'SUSPENDED' || event.status === 'DELETED') && !isAdmin && !isOwner) {
+      return res.status(404).json({
+        success: false,
+        code: 'EVENT_UNAVAILABLE',
+        message: 'This event is currently suspended or no longer available.',
+      });
+    }
+
     const ticketTypes = await TicketType.find({ eventId: event._id });
     const isFree = event.admissionType === 'FREE' || (ticketTypes.length > 0 && ticketTypes.every(t => (t.price || 0) === 0));
 
@@ -382,8 +393,8 @@ export const getEventSeoPreview = async (req, res) => {
     if (!event) {
       event = await Event.findOne({ slug: id }).lean();
     }
-    if (!event) {
-      return res.status(404).send('Event not found');
+    if (!event || event.status === 'SUSPENDED' || event.status === 'DELETED') {
+      return res.status(404).send('Event not found or has been suspended.');
     }
 
     const clientUrl = process.env.CLIENT_URL || 'https://tickza.vercel.app';

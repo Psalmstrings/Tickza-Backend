@@ -41,11 +41,18 @@ export const scanQR = async (req, res) => {
     // 2. Ticket Number (e.g. "TICK-852150-52B2CA", "#TICK-852150-52B2CA", or "852150-52B2CA")
     // 3. Database ObjectId (24-character hex)
     // 4. Exact stored qrToken match
+    const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const safeClean = escapeRegex(cleanInput);
+    const safeRaw = escapeRegex(rawInput);
+    const safeWithoutTick = escapeRegex(cleanInput.replace(/^TICK[-_]?/i, ''));
+
     const orConditions = [
       { qrToken: cleanInput },
       { qrToken: rawInput },
-      { ticketNumber: new RegExp(`^${cleanInput}$`, 'i') },
-      { ticketNumber: new RegExp(`^TICK-${cleanInput}$`, 'i') },
+      { ticketNumber: new RegExp(`^${safeClean}$`, 'i') },
+      { ticketNumber: new RegExp(`^${safeRaw}$`, 'i') },
+      { ticketNumber: new RegExp(`^TICK-${safeWithoutTick}$`, 'i') },
+      { ticketNumber: new RegExp(`${safeWithoutTick}$`, 'i') },
     ];
 
     if (mongoose.Types.ObjectId.isValid(cleanInput) && cleanInput.length === 24) {
@@ -170,8 +177,11 @@ export const scanQR = async (req, res) => {
     const updatedTicket = await Ticket.findOneAndUpdate(
       {
         _id: ticket._id,
-        status: { $in: ['SOLD', 'REGISTERED', 'PARTIALLY_USED'] },
-        attendeesCheckedIn: { $lt: admittedCapacity },
+        status: { $nin: ['USED', 'CANCELLED', 'REFUNDED'] },
+        $or: [
+          { attendeesCheckedIn: { $lt: admittedCapacity } },
+          { attendeesCheckedIn: { $exists: false } },
+        ],
       },
       {
         $inc: { attendeesCheckedIn: countToAdmit },
@@ -182,7 +192,7 @@ export const scanQR = async (req, res) => {
         $push: {
           history: {
             action: 'CHECKED_IN',
-            toUser: ticket.ownerId._id,
+            toUser: ticket.ownerId?._id || ticket.ownerId || req.user._id,
             timestamp: checkInTimestamp,
             notes: `Checked in ${countToAdmit} guest(s) by ${req.user.firstName} ${req.user.lastName} at "${event.title}"`,
           },
@@ -208,7 +218,7 @@ export const scanQR = async (req, res) => {
       });
     }
 
-    const newCheckedInCount = updatedTicket.attendeesCheckedIn;
+    const newCheckedInCount = updatedTicket.attendeesCheckedIn || countToAdmit;
     const isFullyCheckedIn = newCheckedInCount >= admittedCapacity;
     const targetStatus = isFullyCheckedIn ? 'USED' : 'PARTIALLY_USED';
 
@@ -228,15 +238,21 @@ export const scanQR = async (req, res) => {
       notes:             `Admitted ${countToAdmit} attendee(s) for ${ticket.ticketNumber} [${ticket.format || 'INDIVIDUAL'}]`,
     });
 
-    // Notify the ticket owner
+    // Notify the ticket owner if present
     const isFree = ticket.admissionType === 'FREE';
-    await Notification.create({
-      userId:  ticket.ownerId._id,
-      title:   isFree ? 'Pass Checked In ✅' : 'Ticket Checked In ✅',
-      message: `Your ${isFree ? 'free pass' : 'ticket'} for "${event.title}" has been successfully scanned (${newCheckedInCount}/${admittedCapacity} admitted). Enjoy the event!`,
-      type:    'CHECK_IN',
-      data:    { ticketId: ticket._id, eventId: event._id },
-    });
+    if (ticket.ownerId?._id) {
+      try {
+        await Notification.create({
+          userId:  ticket.ownerId._id,
+          title:   isFree ? 'Pass Checked In ✅' : 'Ticket Checked In ✅',
+          message: `Your ${isFree ? 'free pass' : 'ticket'} for "${event.title}" has been successfully scanned (${newCheckedInCount}/${admittedCapacity} admitted). Enjoy the event!`,
+          type:    'CHECK_IN',
+          data:    { ticketId: ticket._id, eventId: event._id },
+        });
+      } catch (e) {
+        console.warn('[CheckIn Notification Warning]', e.message);
+      }
+    }
 
     // Broadcast real-time check-in update to event room
     emitToEvent(event._id, 'check_in', {
@@ -245,7 +261,7 @@ export const scanQR = async (req, res) => {
       admissionType:      ticket.admissionType || 'PAID',
       registrationRef:    ticket.registrationRef || null,
       section:            ticket.section,
-      owner:              `${ticket.ownerId.firstName} ${ticket.ownerId.lastName}`,
+      owner:              ticket.ownerId ? `${ticket.ownerId.firstName || ''} ${ticket.ownerId.lastName || ''}`.trim() : 'Guest Attendee',
       admittedCapacity,
       attendeesCheckedIn: newCheckedInCount,
       checkedInAt:        updatedTicket.checkedInAt || checkInTimestamp,
@@ -284,11 +300,11 @@ export const scanQR = async (req, res) => {
           tableNumber:        ticket.tableNumber,
           status:             ticket.status,
           checkedInAt:        updatedTicket.checkedInAt || checkInTimestamp,
-          owner: {
+          owner: ticket.ownerId ? {
             firstName: ticket.ownerId.firstName,
             lastName:  ticket.ownerId.lastName,
             email:     ticket.ownerId.email,
-          },
+          } : null,
           ticketType: ticket.ticketTypeId?.name || (isFree ? 'Free Pass' : 'General'),
         },
         event: {

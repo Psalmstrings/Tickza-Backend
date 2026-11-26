@@ -95,7 +95,7 @@ const eventSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['DRAFT', 'PENDING_APPROVAL', 'PUBLISHED', 'REJECTED', 'SUSPENDED', 'ENDED'],
+      enum: ['DRAFT', 'PENDING_APPROVAL', 'PUBLISHED', 'REJECTED', 'SUSPENDED', 'ENDED', 'DELETED', 'CANCELLED'],
       default: 'PUBLISHED',
       index: true,
     },

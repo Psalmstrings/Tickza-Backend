@@ -427,6 +427,160 @@ export const rejectEvent = async (req, res) => {
   }
 };
 
+// @desc    Suspend an event (immediately stops displaying publicly)
+// @route   PATCH /api/admin/events/:id/suspend
+// @access  Admin | Super Admin
+export const suspendEvent = async (req, res) => {
+  try {
+    const { reason = 'Event suspended by platform administrator.' } = req.body || {};
+
+    const event = await Event.findById(req.params.id).populate('organizerId', 'firstName lastName email');
+    if (!event) {
+      return res.status(404).json({ success: false, message: 'Event not found' });
+    }
+
+    event.status = 'SUSPENDED';
+    await event.save();
+
+    if (event.organizerId) {
+      await Notification.create({
+        userId: event.organizerId._id,
+        title: 'Event Suspended ⚠️',
+        message: `Your event "${event.title}" has been suspended by an administrator. Reason: ${reason}. It will no longer display publicly.`,
+        type: 'SYSTEM',
+        data: { eventId: event._id, reason },
+      });
+
+      emitToUser(event.organizerId._id, 'notification', {
+        title: 'Event Suspended',
+        message: `"${event.title}" has been suspended.`,
+      });
+    }
+
+    await logAudit({
+      actorId: req.user._id,
+      actorName: `${req.user.firstName} ${req.user.lastName}`,
+      actorRole: req.user.role,
+      action: 'ADMIN_SUSPEND_EVENT',
+      targetType: 'EVENT',
+      targetId: event._id,
+      details: { title: event.title, reason },
+      req,
+    });
+
+    return res.json({
+      success: true,
+      message: `"${event.title}" has been suspended and will no longer display publicly.`,
+      data: { id: event._id, status: event.status },
+    });
+  } catch (error) {
+    console.error('[Admin suspendEvent Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Unsuspend / restore an event to PUBLISHED
+// @route   PATCH /api/admin/events/:id/unsuspend
+// @access  Admin | Super Admin
+export const unsuspendEvent = async (req, res) => {
+  try {
+    const event = await Event.findById(req.params.id).populate('organizerId', 'firstName lastName email');
+    if (!event) {
+      return res.status(404).json({ success: false, message: 'Event not found' });
+    }
+
+    event.status = 'PUBLISHED';
+    await event.save();
+
+    if (event.organizerId) {
+      await Notification.create({
+        userId: event.organizerId._id,
+        title: 'Event Re-activated 🎉',
+        message: `Your event "${event.title}" has been unsuspended and is now publicly live on Tickza.`,
+        type: 'SYSTEM',
+        data: { eventId: event._id },
+      });
+
+      emitToUser(event.organizerId._id, 'notification', {
+        title: 'Event Re-activated',
+        message: `"${event.title}" is live again.`,
+      });
+    }
+
+    await logAudit({
+      actorId: req.user._id,
+      actorName: `${req.user.firstName} ${req.user.lastName}`,
+      actorRole: req.user.role,
+      action: 'ADMIN_UNSUSPEND_EVENT',
+      targetType: 'EVENT',
+      targetId: event._id,
+      details: { title: event.title },
+      req,
+    });
+
+    return res.json({
+      success: true,
+      message: `"${event.title}" has been re-activated and published live.`,
+      data: { id: event._id, status: event.status },
+    });
+  } catch (error) {
+    console.error('[Admin unsuspendEvent Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Delete an event (removes from public listings permanently)
+// @route   DELETE /api/admin/events/:id
+// @access  Admin | Super Admin
+export const deleteAdminEvent = async (req, res) => {
+  try {
+    const { hardDelete = false, reason = 'Removed by platform administrator.' } = req.body || {};
+
+    const event = await Event.findById(req.params.id).populate('organizerId', 'firstName lastName email');
+    if (!event) {
+      return res.status(404).json({ success: false, message: 'Event not found' });
+    }
+
+    const eventTitle = event.title;
+    const orgId = event.organizerId?._id;
+
+    if (hardDelete) {
+      await Event.findByIdAndDelete(req.params.id);
+    } else {
+      event.status = 'DELETED';
+      await event.save();
+    }
+
+    if (orgId) {
+      await Notification.create({
+        userId: orgId,
+        title: 'Event Deleted',
+        message: `Your event "${eventTitle}" was removed by an administrator. Reason: ${reason}.`,
+        type: 'SYSTEM',
+      });
+    }
+
+    await logAudit({
+      actorId: req.user._id,
+      actorName: `${req.user.firstName} ${req.user.lastName}`,
+      actorRole: req.user.role,
+      action: 'ADMIN_DELETE_EVENT',
+      targetType: 'EVENT',
+      targetId: event._id,
+      details: { title: eventTitle, reason, hardDelete },
+      req,
+    });
+
+    return res.json({
+      success: true,
+      message: `"${eventTitle}" has been deleted and will no longer display.`,
+    });
+  } catch (error) {
+    console.error('[Admin deleteAdminEvent Error]', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 // ─── Tickets ──────────────────────────────────────────────────────────────────
 
 // @desc    Get all tickets (paginated)
@@ -595,27 +749,31 @@ export const getStats = async (req, res) => {
 export const getAdminFinancials = async (req, res) => {
   try {
     const [transactions, payouts, users, settings] = await Promise.all([
-      PaymentTransaction.find({ status: 'SUCCESS' }),
-      Payout.find({}),
-      User.find({ isDeleted: false }),
+      PaymentTransaction.find({ status: 'SUCCESS' }).lean(),
+      Payout.find({}).lean(),
+      User.find({ isDeleted: false }).lean(),
       getPlatformCommissionSettings(),
     ]);
 
+    const txList = transactions || [];
+    const payoutList = payouts || [];
+    const userList = users || [];
+
     // Aggregate gross ticket sales, platform commission, Paystack fees, and vendor earnings
-    const totalGrossTicketSales = transactions.reduce((sum, tx) => sum + (tx.grossAmountKobo || 0), 0) / 100;
-    const totalPlatformCommission = transactions.reduce((sum, tx) => sum + (tx.commissionAmountKobo || 0), 0) / 100;
-    const totalProcessingFees = transactions.reduce((sum, tx) => sum + (tx.paystackFeeKobo || 0), 0) / 100;
-    const totalVendorEarnings = transactions.reduce((sum, tx) => sum + (tx.vendorNetShareKobo || 0), 0) / 100;
+    const totalGrossTicketSales = txList.reduce((sum, tx) => sum + (tx.grossAmountKobo || 0), 0) / 100;
+    const totalPlatformCommission = txList.reduce((sum, tx) => sum + (tx.commissionAmountKobo || 0), 0) / 100;
+    const totalProcessingFees = txList.reduce((sum, tx) => sum + (tx.paystackFeeKobo || 0), 0) / 100;
+    const totalVendorEarnings = txList.reduce((sum, tx) => sum + (tx.vendorNetShareKobo || 0), 0) / 100;
 
     // Available and reserved vendor balances
-    const totalVendorAvailable = users.reduce((sum, u) => sum + (u.availableBalanceKobo || 0), 0) / 100;
-    const totalVendorReserved = users.reduce((sum, u) => sum + (u.reservedBalanceKobo || 0), 0) / 100;
+    const totalVendorAvailable = userList.reduce((sum, u) => sum + (u.availableBalanceKobo || 0), 0) / 100;
+    const totalVendorReserved = userList.reduce((sum, u) => sum + (u.reservedBalanceKobo || 0), 0) / 100;
 
     // Payout metrics
-    const pendingPayouts = payouts.filter(p => ['REQUESTED', 'UNDER_REVIEW'].includes(p.status));
-    const processingPayouts = payouts.filter(p => p.status === 'PROCESSING');
-    const completedPayouts = payouts.filter(p => p.status === 'PAID');
-    const failedPayouts = payouts.filter(p => p.status === 'FAILED');
+    const pendingPayouts = payoutList.filter(p => ['REQUESTED', 'UNDER_REVIEW'].includes(p.status));
+    const processingPayouts = payoutList.filter(p => p.status === 'PROCESSING');
+    const completedPayouts = payoutList.filter(p => p.status === 'PAID');
+    const failedPayouts = payoutList.filter(p => p.status === 'FAILED');
 
     const pendingPayoutRequestsCount = pendingPayouts.length;
     const pendingPayoutRequestsAmount = pendingPayouts.reduce((sum, p) => sum + (p.amountKobo ? p.amountKobo / 100 : p.netAmount || 0), 0);
@@ -637,7 +795,7 @@ export const getAdminFinancials = async (req, res) => {
         processingPayoutsAmount,
         completedPayoutsAmount,
         failedPayoutsAmount,
-        totalTransactionsCount: transactions.length,
+        totalTransactionsCount: txList.length,
         settings,
       },
     });
